@@ -1,0 +1,50 @@
+@import 'tailwindcss';
+@import '@heroui/styles';
+
+/*
+ * Project design tokens. Keep custom colors minimal — prefer HeroUI semantic
+ * colors so light/dark theming works without per-component overrides
+ * (same approach as orkg-frontend/src/app/globals.css).
+ */
+@theme {
+    --max-width-container: 1320px;
+}
+
+/*
+ * Form fields: HeroUI's default theme renders fields borderless, and in dark
+ * mode the field background is the same color as the dialog surface, leaving
+ * inputs and select triggers invisible until hovered. Give every field a
+ * resting border and lift the dark field background off the overlay surface.
+ */
+@layer base {
+    :root {
+        --field-border-width: 1px;
+        --field-border: var(--border);
+        /* Links carry the interactive accent; HeroUI's default renders them in
+           plain foreground, indistinguishable from body text at rest. */
+        --link: var(--accent);
+    }
+
+    .dark,
+    [data-theme='dark'] {
+        --field-background: var(--surface-secondary);
+    }
+}
+
+/*
+ * Outline buttons (the Import / Download OWL / Export JSON file actions): the
+ * stock variant is transparent at rest, and its border is only ~4% lightness
+ * away from the background-secondary surfaces these buttons sit on in light
+ * mode, so they don't read as buttons. A surface fill lifts them off those
+ * surfaces in both themes. (The filled `secondary` variant is no fix: its
+ * `--default` fill sits ~2% from the same surfaces in light mode and tints
+ * labels the accent color reserved for links.) Pressed matches hover — the
+ * press feedback comes from the button's scale transform. Unlayered on
+ * purpose: the variant defines these variables in the `components` cascade
+ * layer, which would override a rule in `base`.
+ */
+.button--outline {
+    --button-bg: var(--surface);
+    --button-bg-hover: var(--surface-hover);
+    --button-bg-pressed: var(--surface-hover);
+}
