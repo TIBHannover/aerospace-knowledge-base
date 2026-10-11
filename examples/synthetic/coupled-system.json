@@ -1,0 +1,28 @@
+{
+  "problem_data": {
+    "parallel_type": "shared_memory",
+    "start_time": 0.0,
+    "end_time": 1.0,
+    "echo_level": 1,
+    "print_colors": true
+  },
+  "solver_settings": {
+    "solvers": {
+      "synthetic_solver": {
+        "type": "synthetic"
+      }
+    },
+    "solver": "synthetic_solver",
+    "coupling_sequence": [
+      {
+        "solver": "synthetic_solver",
+        "convergence_accelerators": [
+          {
+            "type": "fixed_point",
+            "echo_level": 0
+          }
+        ]
+      }
+    ]
+  }
+}

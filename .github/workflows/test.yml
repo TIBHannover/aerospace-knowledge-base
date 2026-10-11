@@ -84,7 +84,7 @@ jobs:
           curl -fsS -X POST http://localhost:7200/rest/repositories \
             -F "config=@.github/graphdb/ci-repo-config.ttl"
 
-      - name: Populate initial ontology schema and run integration tests
+      - name: Populate synthetic ontology fixture and run integration tests
         env:
           GRAPHDB_URL: http://localhost:7200
           GRAPHDB_REPOSITORY: coupled-modelling-ci-test

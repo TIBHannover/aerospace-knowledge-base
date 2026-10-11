@@ -156,3 +156,12 @@ cython_debug/
 #.idea/
 
 json2rdf/
+
+# Generated documentation and example outputs
+docs/build/
+examples/**/results/
+examples/**/*.owl
+examples/**/*.vtk
+examples/**/*.vtu
+examples/**/results.csv
+examples/**/export*.json

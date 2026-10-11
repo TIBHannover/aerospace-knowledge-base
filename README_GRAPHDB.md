@@ -57,21 +57,17 @@ To use the explorer, either start the full Docker stack (§0) and open `http://l
 
 ---
 
-## 5. Initializing the Database & Running Demos
+## 5. Loading the Synthetic Example
 
-Once the API server is active, populate the database with the core ontology schema and co-simulation instances:
+With GraphDB running, load the project-owned synthetic configuration:
 
-1. **Populate the Database:**
-   ```bash
-   python backend/test.py
-   ```
-   *(This loads the base co-simulation schema, creates the initial solvers and criteria, and writes the reference ontology file `examples/test.owl`)*
+```bash
+python backend/test.py
+```
 
-2. **Verify with the Workflow Demo:**
-   ```bash
-   python examples/demo_api.py
-   ```
-   *(This validates the client API interactions by building and exporting a complete co-simulation setup to `examples/export_onera_fsi.json`)*
+This imports `examples/synthetic/coupled-system.json` into the configured repository. The fixture exercises the import and persistence pipeline; it is not research data or an evaluation benchmark.
+
+This command modifies the configured repository; use it only with a fresh or dedicated repository. Each run creates another coupled-system instance.
 
 ---
 
