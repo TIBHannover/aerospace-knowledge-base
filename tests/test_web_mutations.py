@@ -1,0 +1,740 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../backend')))
+
+import unittest
+import uuid as uuid_mod
+from unittest.mock import patch
+import main
+from main import GraphDBError
+from fastapi.testclient import TestClient
+from api import app
+
+class TestWebMutations(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        run_id = uuid_mod.uuid4().hex[:8]
+        cls.test_prefix = f"instance_test_m6_{run_id}_"
+        cls.test_inst = f"instance_test_m6_subject_{run_id}"
+        cls.test_obj = f"instance_test_m6_object_{run_id}"
+        cls.onto_uri = "http://coupled_modelling.owl"
+        
+        # Patch main.instance_name to use our test-run prefix
+        def mock_instance_name():
+            import uuid as u
+            return f"{cls.test_prefix}{u.uuid4()}"
+            
+        cls.patcher = patch('main.instance_name', side_effect=mock_instance_name)
+        cls.patcher.start()
+        cls.addClassCleanup(cls.patcher.stop)
+        
+        cls.clear_test_resources()
+
+        init_query = f"""
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        INSERT DATA {{
+            GRAPH <{cls.onto_uri}> {{
+                <http://coupled_modelling.owl#{cls.test_inst}> rdf:type <http://coupled_modelling.owl#solver_settings> .
+                <http://coupled_modelling.owl#{cls.test_inst}> <http://coupled_modelling.owl#has_name> "TestSubject"^^xsd:string .
+                <http://coupled_modelling.owl#{cls.test_inst}> <http://coupled_modelling.owl#has_echo_level> "2"^^xsd:integer .
+                <http://coupled_modelling.owl#{cls.test_inst}> <http://coupled_modelling.owl#has_connect_to> <http://coupled_modelling.owl#{cls.test_obj}> .
+                
+                <http://coupled_modelling.owl#{cls.test_obj}> rdf:type <http://coupled_modelling.owl#solver> .
+                <http://coupled_modelling.owl#{cls.test_obj}> <http://coupled_modelling.owl#has_name> "ExistingObject"^^xsd:string .
+            }}
+        }}
+        """
+        try:
+            main.sparql_update(init_query)
+        except Exception as e:
+            raise unittest.SkipTest(f"GraphDB not available or failed setup: {e}")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.clear_test_resources()
+
+    @classmethod
+    def clear_test_resources(cls):
+        query_find = f"""
+        SELECT DISTINCT ?res WHERE {{
+            GRAPH <{cls.onto_uri}> {{
+                ?res ?p ?o .
+                FILTER(isIRI(?res))
+                FILTER(STRSTARTS(STR(?res), "http://coupled_modelling.owl#{cls.test_prefix}"))
+            }}
+        }}
+        """
+        resources_to_delete = [cls.test_inst, cls.test_obj]
+        try:
+            res = main.query_graphdb(query_find)
+            bindings = res.get("results", {}).get("bindings", [])
+            for b in bindings:
+                local_name = main.get_local_name(b["res"]["value"])
+                if local_name not in [cls.test_inst, cls.test_obj]:
+                    resources_to_delete.append(local_name)
+        except Exception:
+            pass
+
+        operations = []
+        for res in resources_to_delete:
+            operations.append(f"""
+            DELETE WHERE {{
+                GRAPH <{cls.onto_uri}> {{
+                    <http://coupled_modelling.owl#{res}> ?p ?o .
+                }}
+            }}
+            """)
+            operations.append(f"""
+            DELETE WHERE {{
+                GRAPH <{cls.onto_uri}> {{
+                    ?s ?p <http://coupled_modelling.owl#{res}> .
+                }}
+            }}
+            """)
+        
+        if operations:
+            query = " ; ".join(operations)
+            try:
+                main.sparql_update(query)
+            except Exception:
+                pass
+
+    def setUp(self):
+        self.app = TestClient(app)
+
+    def test_create_class_instance_success(self):
+        payload = {
+            "class": "solver",
+            "label": "My New Standalone Solver"
+        }
+        res = self.app.post('/api/v1.0/create_class_instance/', json=payload)
+        self.assertEqual(res.status_code, 201)
+        new_name = res.json()
+        self.assertTrue(new_name.startswith(self.test_prefix))
+
+        # Query GraphDB to confirm
+        query = f"""
+        ASK {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{new_name}> rdf:type <http://coupled_modelling.owl#solver> .
+                <http://coupled_modelling.owl#{new_name}> <http://www.w3.org/2000/01/rdf-schema#label> "My New Standalone Solver"^^xsd:string .
+            }}
+        }}
+        """
+        res_ask = main.query_graphdb(query)
+        self.assertTrue(res_ask.get("boolean", False))
+
+    def test_create_class_instance_missing_args(self):
+        payload = {"class": "solver"}
+        res = self.app.post('/api/v1.0/create_class_instance/', json=payload)
+        self.assertEqual(res.status_code, 400)
+
+    def test_create_class_instance_invalid_class(self):
+        payload = {"class": "non_existent_class", "label": "Test"}
+        res = self.app.post('/api/v1.0/create_class_instance/', json=payload)
+        self.assertEqual(res.status_code, 400)
+
+    def test_delete_value_literal_success(self):
+        payload = {
+            "instance": self.test_inst,
+            "property": "echo_level",
+            "value": {
+                "kind": "literal",
+                "value": 2,
+                "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            }
+        }
+        # First verify it is there
+        query_before = f"""
+        ASK {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_echo_level> "2"^^xsd:integer .
+            }}
+        }}
+        """
+        self.assertTrue(main.query_graphdb(query_before).get("boolean", False))
+
+        # Run deletion
+        res = self.app.post('/api/v1.0/delete_value/', json=payload)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json(), {"status": "success", "target": None, "deleted": [], "kept": []})
+
+        # Confirm deleted
+        self.assertFalse(main.query_graphdb(query_before).get("boolean", False))
+
+    def test_delete_value_object_success(self):
+        # cascade off: the fixture object must survive for the sibling tests.
+        payload = {
+            "instance": self.test_inst,
+            "property": "connect_to",
+            "value": {
+                "kind": "object",
+                "id": self.test_obj
+            },
+            "cascade": False
+        }
+        # First verify it is there
+        query_before = f"""
+        ASK {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_connect_to> <http://coupled_modelling.owl#{self.test_obj}> .
+            }}
+        }}
+        """
+        self.assertTrue(main.query_graphdb(query_before).get("boolean", False))
+
+        # Run deletion
+        res = self.app.post('/api/v1.0/delete_value/', json=payload)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json(), {"status": "success", "target": self.test_obj, "deleted": [], "kept": [self.test_obj]})
+
+        # Confirm deleted
+        self.assertFalse(main.query_graphdb(query_before).get("boolean", False))
+        self.assertTrue(main.instance_exists(self.test_obj))
+
+    def test_delete_value_validation_subject_missing(self):
+        payload = {
+            "instance": "instance_does_not_exist",
+            "property": "echo_level",
+            "value": {
+                "kind": "literal",
+                "value": 2,
+                "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            }
+        }
+        res = self.app.post('/api/v1.0/delete_value/', json=payload)
+        self.assertEqual(res.status_code, 400)
+
+    def test_delete_value_dangling_object_reference_allowed(self):
+        # Contract change: deleting a link whose target no longer exists must succeed —
+        # it is the recovery operation for dangling references, so the existence check
+        # that guards additions does not apply to deletions.
+        payload = {
+            "instance": self.test_inst,
+            "property": "connect_to",
+            "value": {
+                "kind": "object",
+                "id": "instance_does_not_exist"
+            }
+        }
+        res = self.app.post('/api/v1.0/delete_value/', json=payload)
+        self.assertEqual(res.status_code, 200)
+        # Not an individual: neither collected nor kept.
+        self.assertEqual(res.json(), {"status": "success", "target": "instance_does_not_exist", "deleted": [], "kept": []})
+
+    def test_replace_value_missing_params(self):
+        res = self.app.post('/api/v1.0/replace_value/', json={"instance": self.test_inst, "property": "echo_level"})
+        self.assertEqual(res.status_code, 400)
+
+    def test_replace_value_literal_success(self):
+        # Seed a value to replace.
+        main.sparql_update(f"""
+        INSERT DATA {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_parallel_type> "OpenMP" .
+            }}
+        }}
+        """)
+        payload = {
+            "instance": self.test_inst,
+            "property": "parallel_type",
+            "old_value": {"kind": "literal", "value": "OpenMP", "datatype": "http://www.w3.org/2001/XMLSchema#string"},
+            "new_value": {"kind": "literal", "value": "MPI", "datatype": "http://www.w3.org/2001/XMLSchema#string"},
+        }
+        res = self.app.post('/api/v1.0/replace_value/', json=payload)
+        self.assertEqual(res.status_code, 201)
+
+        query_new = f"""
+        ASK {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_parallel_type> "MPI" .
+            }}
+        }}
+        """
+        query_old = query_new.replace('"MPI"', '"OpenMP"')
+        self.assertTrue(main.query_graphdb(query_new).get("boolean", False))
+        self.assertFalse(main.query_graphdb(query_old).get("boolean", False))
+
+    def test_replace_value_missing_old_value_is_noop(self):
+        # Replacing a value that is not stored must not insert the new value.
+        payload = {
+            "instance": self.test_inst,
+            "property": "parallel_type",
+            "old_value": {"kind": "literal", "value": "never_existed", "datatype": "http://www.w3.org/2001/XMLSchema#string"},
+            "new_value": {"kind": "literal", "value": "ghost", "datatype": "http://www.w3.org/2001/XMLSchema#string"},
+        }
+        res = self.app.post('/api/v1.0/replace_value/', json=payload)
+        self.assertEqual(res.status_code, 201)
+        query_ghost = f"""
+        ASK {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_parallel_type> "ghost" .
+            }}
+        }}
+        """
+        self.assertFalse(main.query_graphdb(query_ghost).get("boolean", False))
+
+    def test_replace_value_preserves_language_tag(self):
+        main.sparql_update(f"""
+        INSERT DATA {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_comment> "Ein Loeser"@de .
+            }}
+        }}
+        """)
+        payload = {
+            "instance": self.test_inst,
+            "property": "comment",
+            "old_value": {"kind": "literal", "value": "Ein Loeser", "language": "de"},
+            "new_value": {"kind": "literal", "value": "Ein Solver", "language": "de"},
+        }
+        res = self.app.post('/api/v1.0/replace_value/', json=payload)
+        self.assertEqual(res.status_code, 201)
+        query_new = f"""
+        ASK {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_comment> "Ein Solver"@de .
+            }}
+        }}
+        """
+        self.assertTrue(main.query_graphdb(query_new).get("boolean", False))
+
+    def test_download_owl_success(self):
+        res = self.app.get('/api/v1.0/download_owl/')
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.headers.get("Content-Type", "").startswith("application/rdf+xml"))
+        self.assertIn("attachment", res.headers.get("Content-Disposition", ""))
+        self.assertTrue(len(res.content) > 0)
+
+    def test_database_error_503(self):
+        # Patch query_graphdb to raise GraphDBError
+        with patch('main.sparql_update', side_effect=GraphDBError("Connection timeout")):
+            payload = {
+                "class": "solver",
+                "label": "Fail Solver"
+            }
+            res = self.app.post('/api/v1.0/create_class_instance/', json=payload)
+            self.assertEqual(res.status_code, 503)
+
+    def test_delete_instance_missing_param(self):
+        res = self.app.post('/api/v1.0/delete_instance/', json={})
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("error", res.json())
+
+    def test_delete_instance_success(self):
+        create_res = self.app.post('/api/v1.0/create_class_instance/', json={
+            "class": "solvers",
+            "label": "ToDeleteInstance"
+        })
+        self.assertEqual(create_res.status_code, 201)
+        inst_id = create_res.json()
+
+        delete_res = self.app.post('/api/v1.0/delete_instance/', json={
+            "instance": inst_id
+        })
+        self.assertEqual(delete_res.status_code, 200)
+        self.assertEqual(delete_res.json().get("status"), "success")
+        self.assertEqual(delete_res.json().get("instance"), inst_id)
+        self.assertFalse(main.instance_exists(inst_id))
+
+    def _seed_subtree(self):
+        """
+        root -> child -> grandchild; child -> shared term (also linked by an outsider,
+        with its own descendant and a link back to the root) and an exclusive term;
+        child also links a class IRI and another coupled system; an outsider links the root.
+        """
+        keys = ('root', 'child', 'grandchild', 'shared', 'sharedchild', 'exclusive', 'outsider', 'othersystem')
+        names = {key: f"{self.test_prefix}{key}_{uuid_mod.uuid4().hex[:6]}" for key in keys}
+        iri = {key: main.serialize_iri(name) for key, name in names.items()}
+        main.sparql_update(f"""
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        INSERT DATA {{
+            GRAPH <{self.onto_uri}> {{
+                {iri['root']} rdf:type {main.serialize_iri('coupled_system')} .
+                {iri['root']} {main.serialize_iri('has_solver_settings')} {iri['child']} .
+                {iri['child']} rdf:type {main.serialize_iri('solver_settings')} .
+                {iri['child']} {main.serialize_iri('has_solvers')} {iri['grandchild']} .
+                {iri['child']} {main.serialize_iri('has_type')} {iri['shared']} .
+                {iri['child']} {main.serialize_iri('has_name')} {iri['exclusive']} .
+                {iri['child']} {main.serialize_iri('has_type')} {main.serialize_iri('solver_settings')} .
+                {iri['child']} {main.serialize_iri('has_connect_to')} {iri['othersystem']} .
+                {iri['grandchild']} rdf:type {main.serialize_iri('solvers')} .
+                {iri['shared']} rdf:type {main.serialize_iri('type')} .
+                {iri['shared']} rdfs:label "shared_term"^^xsd:string .
+                {iri['shared']} {main.serialize_iri('has_data')} {iri['sharedchild']} .
+                {iri['shared']} {main.serialize_iri('has_connect_to')} {iri['root']} .
+                {iri['sharedchild']} rdf:type {main.serialize_iri('data')} .
+                {iri['exclusive']} rdf:type {main.serialize_iri('name')} .
+                {iri['exclusive']} rdfs:label "exclusive_term"^^xsd:string .
+                {iri['outsider']} rdf:type {main.serialize_iri('solver_settings')} .
+                {iri['outsider']} {main.serialize_iri('has_type')} {iri['shared']} .
+                {iri['outsider']} {main.serialize_iri('has_connect_to')} {iri['root']} .
+                {iri['othersystem']} rdf:type {main.serialize_iri('coupled_system')} .
+            }}
+        }}
+        """)
+        return names
+
+    def _link_exists(self, subject, prop, obj):
+        ask = f"ASK {{ GRAPH <{self.onto_uri}> {{ {main.serialize_iri(subject)} {main.serialize_iri(prop)} {main.serialize_iri(obj)} . }} }}"
+        return main.query_graphdb(ask)["boolean"]
+
+    def _assert_cascade_sets(self, body, names):
+        self.assertEqual(body["instance"], names['root'])
+        self.assertEqual(body["deleted"][0], names['root'])
+        self.assertEqual(set(body["deleted"]), {names['root'], names['child'], names['grandchild'], names['exclusive']})
+        # Kept: the shared term with its descendant, and the other coupled system (a boundary).
+        self.assertEqual(set(body["kept"]), {names['shared'], names['sharedchild'], names['othersystem']})
+        # Both links into the root go: from the outsider and from the kept shared term.
+        self.assertEqual(set(body["unlinked_from"]), {names['outsider'], names['shared']})
+
+    def test_delete_instance_cascades_over_the_owned_subtree(self):
+        names = self._seed_subtree()
+        res = self.app.post('/api/v1.0/delete_instance/', json={"instance": names['root']})
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual(body["status"], "success")
+        self._assert_cascade_sets(body, names)
+        for key in ('root', 'child', 'grandchild', 'exclusive'):
+            self.assertFalse(main.instance_exists(names[key]), key)
+        for key in ('shared', 'sharedchild', 'outsider', 'othersystem'):
+            self.assertTrue(main.instance_exists(names[key]), key)
+        self.assertTrue(self._link_exists(names['outsider'], 'has_type', names['shared']))
+        self.assertFalse(self._link_exists(names['outsider'], 'has_connect_to', names['root']))
+        # The class IRI linked from the deleted child is untouched.
+        class_ask = f"ASK {{ GRAPH <{self.onto_uri}> {{ {main.serialize_iri('solver_settings')} rdf:type <http://www.w3.org/2002/07/owl#Class> . }} }}"
+        self.assertTrue(main.query_graphdb("PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n" + class_ask)["boolean"])
+
+    def test_delete_instance_without_cascade_keeps_children(self):
+        names = self._seed_subtree()
+        res = self.app.post('/api/v1.0/delete_instance/', json={"instance": names['root'], "cascade": False})
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual(body["deleted"], [names['root']])
+        self.assertEqual(body["kept"], [])
+        self.assertEqual(set(body["unlinked_from"]), {names['outsider'], names['shared']})
+        self.assertFalse(main.instance_exists(names['root']))
+        self.assertTrue(main.instance_exists(names['child']))
+
+    def test_delete_instance_rejects_non_boolean_cascade(self):
+        res = self.app.post('/api/v1.0/delete_instance/', json={"instance": self.test_inst, "cascade": "yes"})
+        self.assertEqual(res.status_code, 400)
+        self.assertTrue(main.instance_exists(self.test_inst))
+
+    def test_delete_instance_rejects_classes(self):
+        res = self.app.post('/api/v1.0/delete_instance/', json={"instance": "solver_settings"})
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(self.app.get('/api/v1.0/get_instance_deletion_preview/?instance=solver_settings').status_code, 400)
+
+    def test_deletion_preview_matches_the_cascade_without_deleting(self):
+        names = self._seed_subtree()
+        res = self.app.get(f"/api/v1.0/get_instance_deletion_preview/?instance={names['root']}")
+        self.assertEqual(res.status_code, 200)
+        self._assert_cascade_sets(res.json(), names)
+        self.assertTrue(main.instance_exists(names['root']))
+
+    def test_deletion_preview_without_cascade(self):
+        names = self._seed_subtree()
+        res = self.app.get(f"/api/v1.0/get_instance_deletion_preview/?instance={names['root']}&cascade=false")
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual(body["deleted"], [names['root']])
+        self.assertEqual(body["kept"], [])
+        self.assertEqual(set(body["unlinked_from"]), {names['outsider'], names['shared']})
+        self.assertEqual(self.app.get(f"/api/v1.0/get_instance_deletion_preview/?instance={names['root']}&cascade=maybe").status_code, 400)
+
+    def test_deletion_preview_errors(self):
+        self.assertEqual(self.app.get('/api/v1.0/get_instance_deletion_preview/').status_code, 400)
+        missing = self.app.get('/api/v1.0/get_instance_deletion_preview/?instance=instance_missing_zz')
+        self.assertEqual(missing.status_code, 400)
+
+    def _unlink(self, holder, prop, target, **extra):
+        payload = {"instance": holder, "property": prop, "value": {"kind": "object", "id": target}, **extra}
+        return self.app.post('/api/v1.0/delete_value/', json=payload)
+
+    def _insert_link(self, subject, prop, obj):
+        main.sparql_update(f"INSERT DATA {{ GRAPH <{self.onto_uri}> {{ {main.serialize_iri(subject)} {main.serialize_iri(prop)} {main.serialize_iri(obj)} . }} }}")
+
+    def _assert_unlink_sets(self, body, names):
+        """
+        Unlinking the child from the root: its exclusive branch goes; the shared term,
+        the other system and the root (reached through the shared term's back-link) stay.
+        """
+        self.assertEqual(body["target"], names['child'])
+        self.assertEqual(body["deleted"][0], names['child'])
+        self.assertEqual(set(body["deleted"]), {names['child'], names['grandchild'], names['exclusive']})
+        self.assertEqual(set(body["kept"]), {names['shared'], names['sharedchild'], names['othersystem'], names['root']})
+
+    def test_delete_value_collects_the_unlinked_subtree(self):
+        names = self._seed_subtree()
+        res = self._unlink(names['root'], 'solver_settings', names['child'])
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual(body["status"], "success")
+        self._assert_unlink_sets(body, names)
+        self.assertFalse(self._link_exists(names['root'], 'has_solver_settings', names['child']))
+        for key in ('child', 'grandchild', 'exclusive'):
+            self.assertFalse(main.instance_exists(names[key]), key)
+        for key in ('root', 'shared', 'sharedchild', 'outsider', 'othersystem'):
+            self.assertTrue(main.instance_exists(names[key]), key)
+        self.assertTrue(self._link_exists(names['outsider'], 'has_type', names['shared']))
+
+    def test_delete_value_keeps_a_target_still_linked_from_elsewhere(self):
+        names = self._seed_subtree()
+        res = self._unlink(names['child'], 'type', names['shared'])
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual((body["target"], body["deleted"], body["kept"]), (names['shared'], [], [names['shared']]))
+        self.assertFalse(self._link_exists(names['child'], 'has_type', names['shared']))
+        self.assertTrue(main.instance_exists(names['sharedchild']))
+
+    def test_delete_value_keeps_a_coupled_system_target(self):
+        names = self._seed_subtree()
+        res = self._unlink(names['child'], 'connect_to', names['othersystem'])
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["kept"], [names['othersystem']])
+        self.assertFalse(self._link_exists(names['child'], 'has_connect_to', names['othersystem']))
+        self.assertTrue(main.instance_exists(names['othersystem']))
+
+    def test_delete_value_without_cascade_keeps_the_target(self):
+        names = self._seed_subtree()
+        res = self._unlink(names['root'], 'solver_settings', names['child'], cascade=False)
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual((body["deleted"], body["kept"]), ([], [names['child']]))
+        self.assertFalse(self._link_exists(names['root'], 'has_solver_settings', names['child']))
+        self.assertTrue(main.instance_exists(names['grandchild']))
+
+    def test_delete_value_of_one_of_two_links_to_the_same_target_keeps_it(self):
+        names = self._seed_subtree()
+        self._insert_link(names['root'], 'has_connect_to', names['child'])
+        res = self._unlink(names['root'], 'solver_settings', names['child'])
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["kept"], [names['child']])
+        self.assertFalse(self._link_exists(names['root'], 'has_solver_settings', names['child']))
+        self.assertTrue(self._link_exists(names['root'], 'has_connect_to', names['child']))
+
+    def test_delete_value_of_a_link_that_is_not_stored_collects_nothing(self):
+        # An orphan with no incoming link at all: only the stored-link rule protects it.
+        names = self._seed_subtree()
+        orphan = self.app.post('/api/v1.0/create_class_instance/', json={"class": "solvers", "label": "orphan"}).json()
+        res = self._unlink(names['root'], 'solvers', orphan)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual((res.json()["deleted"], res.json()["kept"]), ([], [orphan]))
+        self.assertTrue(main.instance_exists(orphan))
+
+    def test_delete_value_of_a_self_link_keeps_the_holder(self):
+        names = self._seed_subtree()
+        self._insert_link(names['child'], 'has_connect_to', names['child'])
+        res = self._unlink(names['child'], 'connect_to', names['child'])
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["kept"], [names['child']])
+        self.assertFalse(self._link_exists(names['child'], 'has_connect_to', names['child']))
+        self.assertTrue(main.instance_exists(names['child']))
+
+    def test_delete_value_of_a_class_link_collects_nothing(self):
+        names = self._seed_subtree()
+        res = self._unlink(names['child'], 'type', 'solver_settings')
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual((body["target"], body["deleted"], body["kept"]), ('solver_settings', [], []))
+        self.assertFalse(self._link_exists(names['child'], 'has_type', 'solver_settings'))
+        class_ask = f"ASK {{ GRAPH <{self.onto_uri}> {{ {main.serialize_iri('solver_settings')} {main.RDF_TYPE} <http://www.w3.org/2002/07/owl#Class> . }} }}"
+        self.assertTrue(main.query_graphdb(class_ask)["boolean"])
+
+    def test_delete_value_rejects_non_boolean_cascade(self):
+        res = self._unlink(self.test_inst, 'connect_to', self.test_obj, cascade='yes')
+        self.assertEqual(res.status_code, 400)
+
+    def test_value_deletion_preview_matches_the_unlink_without_deleting(self):
+        names = self._seed_subtree()
+        res = self.app.get(f"/api/v1.0/get_value_deletion_preview/?instance={names['root']}&property=solver_settings&target={names['child']}")
+        self.assertEqual(res.status_code, 200)
+        self._assert_unlink_sets(res.json(), names)
+        self.assertTrue(self._link_exists(names['root'], 'has_solver_settings', names['child']))
+        self.assertTrue(main.instance_exists(names['exclusive']))
+
+    def test_value_deletion_preview_errors(self):
+        url = '/api/v1.0/get_value_deletion_preview/'
+        self.assertEqual(self.app.get(f'{url}?instance={self.test_inst}&property=connect_to').status_code, 400)
+        self.assertEqual(self.app.get(f'{url}?instance=instance_missing_zz&property=connect_to&target={self.test_obj}').status_code, 400)
+        self.assertEqual(self.app.get(f'{url}?instance={self.test_inst}&property=connect_to&target=bad%20name').status_code, 400)
+        self.assertEqual(self.app.get(f'{url}?instance={self.test_inst}&property=bad%20name&target=instance_missing_zz').status_code, 400)
+        self.assertEqual(self.app.get(f'{url}?instance=solver_settings&property=connect_to&target={self.test_obj}').status_code, 400)
+
+    def test_individual_rule_rejects_classes_and_properties(self):
+        self.assertTrue(main.instance_exists(self.test_inst))
+        self.assertFalse(main.instance_exists('solver_settings'))
+        self.assertFalse(main.instance_exists('has_solver_settings'))
+        self.assertEqual(self.app.get('/api/v1.0/get_instance_property_metadata/?instance=solver_settings').status_code, 400)
+        self.assertEqual(self.app.post('/api/v1.0/add_values/', json={"instance": "solver_settings", "data": {"echo_level": 1}}).status_code, 400)
+        self.assertEqual(self.app.post('/api/v1.0/create_instance/', json={"property": "solver_settings", "parent": "coupled_system"}).status_code, 400)
+        res = self.app.post('/api/v1.0/replace_value/', json={
+            "instance": self.test_inst,
+            "property": "connect_to",
+            "old_value": {"kind": "object", "id": self.test_obj},
+            "new_value": {"kind": "object", "id": "has_name"},
+        })
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("does not exist", res.json()["error"])
+
+    def test_instance_metadata_describes_linked_objects(self):
+        # Re-assert the link: sibling tests in this class delete the fixture's
+        # connect_to triple, and test order must not matter.
+        add_res = self.app.post('/api/v1.0/add_values/', json={
+            "instance": self.test_inst,
+            "data": {"connect_to": self.test_obj}
+        })
+        self.assertEqual(add_res.status_code, 201)
+
+        res = self.app.get(f'/api/v1.0/get_instance_property_metadata/?instance={self.test_inst}')
+        self.assertEqual(res.status_code, 200)
+        groups = {group["property"]: group["values"] for group in res.json()["properties"]}
+
+        linked = groups["connect_to"][0]
+        self.assertEqual(linked["kind"], "object")
+        self.assertEqual(linked["id"], self.test_obj)
+        # The unlabeled target still gets described: its class and a preview.
+        self.assertEqual(linked["label"], self.test_obj)
+        self.assertEqual(linked["types"], ["solver"])
+        self.assertIn({"property": "name", "value": "ExistingObject", "kind": "literal"}, linked["property_preview"])
+        self.assertFalse(linked["preview_truncated"])
+
+    def test_add_values_accepts_literal_on_datatype_property(self):
+        payload = {
+            "instance": self.test_inst,
+            "data": {"num_coupling_iterations": 12}
+        }
+        res = self.app.post('/api/v1.0/add_values/', json=payload)
+        self.assertEqual(res.status_code, 201)
+
+        query = f"""
+        ASK {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_num_coupling_iterations> "12"^^xsd:integer .
+            }}
+        }}
+        """
+        self.assertTrue(main.query_graphdb(query).get("boolean", False))
+
+    def test_add_values_resolves_label_to_existing_instance(self):
+        # Labels resolve globally, so keep them unique per test run: a leftover
+        # from a crashed or concurrent run must not be able to satisfy LIMIT 1.
+        label = f"Existing Label Target {self.test_prefix}"
+        create_res = self.app.post('/api/v1.0/create_class_instance/', json={
+            "class": "solver",
+            "label": label
+        })
+        self.assertEqual(create_res.status_code, 201)
+        target_id = create_res.json()
+
+        res = self.app.post('/api/v1.0/add_values/', json={
+            "instance": self.test_inst,
+            "data": {"solver": label}
+        })
+        self.assertEqual(res.status_code, 201)
+
+        query = f"""
+        ASK {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_solver> <http://coupled_modelling.owl#{target_id}> .
+            }}
+        }}
+        """
+        self.assertTrue(main.query_graphdb(query).get("boolean", False))
+
+    def test_add_values_creates_labeled_instance_for_unknown_label(self):
+        label = f"Brand New Label Target {self.test_prefix}"
+        res = self.app.post('/api/v1.0/add_values/', json={
+            "instance": self.test_inst,
+            "data": {"solver": label}
+        })
+        self.assertEqual(res.status_code, 201)
+
+        query = f"""
+        SELECT ?obj WHERE {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_solver> ?obj .
+                ?obj rdf:type <http://coupled_modelling.owl#solver> .
+                ?obj <http://www.w3.org/2000/01/rdf-schema#label> "{label}"^^xsd:string .
+            }}
+        }}
+        """
+        bindings = main.query_graphdb(query).get("results", {}).get("bindings", [])
+        self.assertEqual(len(bindings), 1)
+        new_ref = main.get_local_name(bindings[0]["obj"]["value"])
+        self.assertTrue(new_ref.startswith(self.test_prefix))
+
+    def test_add_values_resolves_each_label_in_a_list(self):
+        labels = [f"List Label A {self.test_prefix}", f"List Label B {self.test_prefix}"]
+        res = self.app.post('/api/v1.0/add_values/', json={
+            "instance": self.test_inst,
+            "data": {"solver": labels}
+        })
+        self.assertEqual(res.status_code, 201)
+
+        query = f"""
+        SELECT ?label WHERE {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_solver> ?obj .
+                ?obj <http://www.w3.org/2000/01/rdf-schema#label> ?label .
+                FILTER(STRSTARTS(STR(?label), "List Label"))
+            }}
+        }}
+        """
+        bindings = main.query_graphdb(query).get("results", {}).get("bindings", [])
+        self.assertEqual(sorted(b["label"]["value"] for b in bindings), labels)
+
+    def test_add_values_rejects_null_values(self):
+        res = self.app.post('/api/v1.0/add_values/', json={
+            "instance": self.test_inst,
+            "data": {"echo_level": None}
+        })
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("error", res.json())
+
+    def test_add_values_rejects_missing_instance_reference(self):
+        res = self.app.post('/api/v1.0/add_values/', json={
+            "instance": self.test_inst,
+            "data": {"solver": "instance_does_not_exist_999"}
+        })
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("does not exist", res.json().get("error", ""))
+
+    def test_add_values_invalid_reference_inserts_nothing(self):
+        orphan_label = f"Orphan Candidate {self.test_prefix}"
+        res = self.app.post('/api/v1.0/add_values/', json={
+            "instance": self.test_inst,
+            "data": {
+                "num_coupling_iterations": 77,
+                "solver": [orphan_label, "instance_does_not_exist_999"]
+            }
+        })
+        self.assertEqual(res.status_code, 400)
+
+        query = f"""
+        ASK {{
+            GRAPH <{self.onto_uri}> {{
+                <http://coupled_modelling.owl#{self.test_inst}> <http://coupled_modelling.owl#has_num_coupling_iterations> "77"^^xsd:integer .
+            }}
+        }}
+        """
+        self.assertFalse(main.query_graphdb(query).get("boolean", False))
+
+        # The label that would have been resolved-or-created must not leave an
+        # orphan instance behind when the request fails validation.
+        orphan_query = f"""
+        ASK {{
+            GRAPH <{self.onto_uri}> {{
+                ?inst <http://www.w3.org/2000/01/rdf-schema#label> "{orphan_label}"^^xsd:string .
+            }}
+        }}
+        """
+        self.assertFalse(main.query_graphdb(orphan_query).get("boolean", False))
+
+if __name__ == '__main__':
+    unittest.main()

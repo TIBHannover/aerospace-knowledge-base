@@ -1,0 +1,2888 @@
+from owlready2 import *
+import types
+import os
+import uuid
+import requests
+import io
+import xml.etree.ElementTree as ET
+from collections import Counter
+
+GRAPHDB_URL = os.getenv("GRAPHDB_URL", "http://localhost:7200")
+REPOSITORY = os.getenv("GRAPHDB_REPOSITORY", "coupled_modelling")
+GRAPHDB_USER = os.getenv("GRAPHDB_USER")
+GRAPHDB_PASSWORD = os.getenv("GRAPHDB_PASSWORD")
+
+
+class GraphDBError(RuntimeError):
+    """Raised when communication with GraphDB fails."""
+    pass
+
+
+def get_graphdb_auth():
+    if GRAPHDB_USER and GRAPHDB_PASSWORD:
+        return (GRAPHDB_USER, GRAPHDB_PASSWORD)
+    return None
+
+
+def get_onto_path():
+    path = os.path.dirname(os.path.realpath(__file__))
+    path = os.path.join(path, 'onto.owl')
+    return path
+
+
+def get_db_path():
+    path = os.path.dirname(os.path.realpath(__file__))
+    path = os.path.join(path, 'db.sqlite3')
+    return path
+
+
+RDF_TYPE = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"
+
+
+def get_uri(name):
+    if name.startswith('http'):
+        return name
+    return f"http://coupled_modelling.owl#{name}"
+
+
+def get_local_name(uri):
+    if '#' in uri:
+        return uri.split('#')[-1]
+    return uri.split('/')[-1]
+
+
+def query_graphdb(sparql_query):
+    """
+    Executes a SPARQL query against the GraphDB repository.
+    Returns the JSON results as a dictionary.
+    """
+    url = f"{GRAPHDB_URL}/repositories/{REPOSITORY}"
+    headers = {
+        "Accept": "application/sparql-results+json",
+        "Content-Type": "application/sparql-query"
+    }
+    try:
+        response = requests.post(url, data=sparql_query, headers=headers, auth=get_graphdb_auth())
+    except Exception as conn_err:
+        raise GraphDBError(f"Connection to GraphDB failed: {conn_err}") from conn_err
+
+    if response.status_code != 200:
+        raise GraphDBError(f"GraphDB SPARQL query failed with status code {response.status_code}: {response.text}")
+    return response.json()
+
+
+def sparql_update(sparql_query):
+    """
+    Executes a SPARQL update statement against the GraphDB repository.
+    """
+    url = f"{GRAPHDB_URL}/repositories/{REPOSITORY}/statements"
+    headers = {
+        "Content-Type": "application/sparql-update"
+    }
+    try:
+        response = requests.post(url, data=sparql_query, headers=headers, auth=get_graphdb_auth())
+    except Exception as conn_err:
+        raise GraphDBError(f"Connection to GraphDB failed: {conn_err}") from conn_err
+
+    if response.status_code not in (200, 204):
+        raise GraphDBError(f"SPARQL update failed with status code {response.status_code}: {response.text}")
+
+
+def validate_local_name(name):
+    """Validates that a local name is safe for use in IRIs."""
+    if not name or not all(c.isalnum() or c in ('_', '-', '.') for c in name):
+        raise ValueError(f"Invalid local name: {name}")
+
+
+def serialize_iri(local_name):
+    """Validates and wraps a local name as a full IRI."""
+    validate_local_name(local_name)
+    return f"<http://coupled_modelling.owl#{local_name}>"
+
+
+def term_iri(term):
+    """The IRI inside a serialized `<term>`."""
+    return term[1:-1]
+
+
+def serialize_literal(value):
+    """Serializes a Python value into a properly typed SPARQL literal."""
+    if isinstance(value, bool):
+        return f'"{str(value).lower()}"^^xsd:boolean'
+    elif isinstance(value, int):
+        return f'"{value}"^^xsd:integer'
+    elif isinstance(value, float):
+        return f'"{value}"^^xsd:double'
+    elif isinstance(value, str):
+        escaped = (
+            value
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        )
+        return f'"{escaped}"^^xsd:string'
+    raise ValueError(f"Unsupported literal type: {type(value)}")
+
+
+def serialize_object(value):
+    """Dispatches to IRI or literal serialization based on type."""
+    if isinstance(value, str) and value.startswith("instance"):
+        return serialize_iri(value)
+    return serialize_literal(value)
+
+
+def escape_string_content(val):
+    return (
+        str(val)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+
+
+def serialize_metadata_value(value_obj, require_existing=True):
+    """Converts structured value metadata objects (from the frontend UI) into valid SPARQL terms.
+
+    Args:
+        value_obj: Scalar value or a typed dict ({kind: object|literal, ...}).
+        require_existing: When False, object references are serialized without the
+            existence check — deletions must be able to target dangling links.
+    """
+    if not isinstance(value_obj, dict):
+        return serialize_object(value_obj)
+
+    kind = value_obj.get("kind")
+    if kind == "object":
+        id_val = value_obj.get("id")
+        if require_existing and not instance_exists(id_val):
+            raise ValueError(f"Referenced instance {id_val} does not exist in GraphDB.")
+        return serialize_iri(id_val)
+
+    language = value_obj.get("language")
+    if language:
+        # Language-tagged literals are only term-equal with their tag ("val"@de).
+        validate_local_name(language)
+        escaped = escape_string_content(value_obj.get("value"))
+        return f'"{escaped}"@{language}'
+
+    if value_obj.get("datatype") == "http://www.w3.org/2001/XMLSchema#anyURI":
+        # The metadata read presents external IRI objects as anyURI pseudo-literals;
+        # the stored triple object is an IRI term and must be serialized as one.
+        uri = str(value_obj.get("value"))
+        if any(ch in uri for ch in '<>"{}|\\^`') or any(ch.isspace() for ch in uri):
+            raise ValueError("Invalid characters in IRI value.")
+        return f"<{uri}>"
+
+    val = value_obj.get("value")
+    datatype = value_obj.get("datatype")
+    
+    if datatype:
+        if datatype == "http://www.w3.org/2001/XMLSchema#string":
+            return serialize_literal(str(val))
+        elif datatype == "http://www.w3.org/2001/XMLSchema#integer":
+            return f'"{int(val)}"^^<{datatype}>'
+        elif datatype in ["http://www.w3.org/2001/XMLSchema#double", "http://www.w3.org/2001/XMLSchema#decimal"]:
+            return f'"{float(val)}"^^<{datatype}>'
+        elif datatype == "http://www.w3.org/2001/XMLSchema#boolean":
+            if isinstance(val, str):
+                bool_val = val.strip().lower() in ("true", "1", "yes")
+            else:
+                bool_val = bool(val)
+            return f'"{str(bool_val).lower()}"^^<{datatype}>'
+        else:
+            escaped = escape_string_content(val)
+            return f'"{escaped}"^^<{datatype}>'
+            
+    return serialize_literal(val)
+
+
+
+def push_to_graphdb():
+    """Exports the local ontology and pushes it to GraphDB via REST API replacing the named graph."""
+    try:
+        temp_path = os.path.join(os.path.dirname(get_onto_path()), "temp_sync.owl")
+        try:
+            onto.save(temp_path)
+            with open(temp_path, "r", encoding="utf-8") as f:
+                data_str = f.read()
+            
+            data = data_str.encode("utf-8")
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+        url = f"{GRAPHDB_URL}/repositories/{REPOSITORY}/statements"
+        headers = {"Content-Type": "application/rdf+xml"}
+        params = {"context": f"<{onto_uri}>"}
+        response = requests.put(url, data=data, headers=headers, params=params, auth=get_graphdb_auth())
+        if response.status_code not in [200, 204]:
+            print(f"Failed to push to GraphDB: {response.status_code} - {response.text}")
+        else:
+            print("Successfully synchronized local ontology with GraphDB (named graph).")
+            # Note: GraphDB/RDF4J normalizes empty-path base URIs to include a trailing slash (RFC 3986).
+            # Because Owlready2 saves using relative `rdf:about="#entity"` references, the GraphDB parser
+            # resolves them to `http://coupled_modelling.owl/#entity`. 
+            # We run a SPARQL update here to clean and restore them to the canonical hash namespace (`...#entity`).
+            try:
+                update_url = f"{GRAPHDB_URL}/repositories/{REPOSITORY}/statements"
+                update_headers = {"Content-Type": "application/sparql-update"}
+                update_query = f"""
+                DELETE {{
+                    GRAPH <{onto_uri}> {{
+                        ?s ?p ?o .
+                    }}
+                }}
+                INSERT {{
+                    GRAPH <{onto_uri}> {{
+                        ?s2 ?p2 ?o2 .
+                    }}
+                }}
+                WHERE {{
+                    GRAPH <{onto_uri}> {{
+                        ?s ?p ?o .
+                        BIND(IF(isIRI(?s),
+                            IRI(REPLACE(STR(?s), "^http://coupled_modelling\\\\.owl/#", "http://coupled_modelling.owl#")),
+                            ?s
+                        ) AS ?s2)
+                        BIND(IF(isIRI(?p),
+                            IRI(REPLACE(STR(?p), "^http://coupled_modelling\\\\.owl/#", "http://coupled_modelling.owl#")),
+                            ?p
+                        ) AS ?p2)
+                        BIND(IF(isIRI(?o),
+                            IRI(REPLACE(STR(?o), "^http://coupled_modelling\\\\.owl/#", "http://coupled_modelling.owl#")),
+                            ?o
+                        ) AS ?o2)
+                        FILTER(?s != ?s2 || ?p != ?p2 || ?o != ?o2)
+                    }}
+                }}
+                """
+                update_res = requests.post(update_url, data=update_query, headers=update_headers, auth=get_graphdb_auth())
+                if update_res.status_code not in [200, 204]:
+                    print(f"Failed to run GraphDB namespace rewrite: {update_res.status_code} - {update_res.text}")
+                else:
+                    print("Successfully rewrote GraphDB namespaces (removed trailing slashes).")
+            except Exception as rewrite_err:
+                print(f"Failed to rewrite GraphDB namespaces: {rewrite_err}")
+    except Exception as e:
+        print(f"Failed to push to GraphDB: {e}")
+
+
+def pull_from_graphdb():
+    """Fetches ontology from GraphDB named graph directly."""
+    url = f"{GRAPHDB_URL}/repositories/{REPOSITORY}/statements"
+    headers = {"Accept": "application/rdf+xml"}
+    params = {"context": f"<{onto_uri}>", "infer": "false"}
+    try:
+        response = requests.get(url, headers=headers, params=params, auth=get_graphdb_auth())
+        if response.status_code == 200:
+            content = response.content
+            if b"rdf:about" in content or b"rdf:Description" in content:
+                # Validate XML
+                try:
+                    ET.fromstring(content)
+                    return content
+                except Exception as xml_err:
+                    print(f"Invalid RDF/XML retrieved from GraphDB: {xml_err}")
+                    return None
+        return None
+    except Exception as e:
+        print(f"Could not pull from GraphDB: {e}")
+        return None
+
+
+def reload_ontology_from_graphdb():
+    global onto, default_world
+    try:
+        import owlready2
+        owlready2.default_world = owlready2.World()
+        default_world = owlready2.default_world
+        onto = load_onto()
+    except Exception as e:
+        print(f"Failed to load latest ontology from GraphDB: {e}")
+
+
+def new_onto():
+    onto = default_world.get_ontology(onto_uri)
+    return onto
+
+
+def load_onto():
+    """
+    Loads an ontology.
+
+    Returns:
+        Loaded ontology
+    """ 
+    rdf_xml_data = None
+    try:
+        rdf_xml_data = pull_from_graphdb()
+    except Exception as e:
+        print(f"Failed to pull from GraphDB during load: {e}")
+
+    onto = default_world.get_ontology(onto_uri)
+
+    if rdf_xml_data:
+        try:
+            onto.load(fileobj=io.BytesIO(rdf_xml_data))
+            print("Successfully loaded ontology from GraphDB.")
+            return onto
+        except Exception as e:
+            print(f"Failed to load pulled RDF/XML into Owlready2: {e}. Falling back to local onto.owl.")
+
+    try:
+        with open(get_onto_path(), "rb") as f:
+            onto.load(fileobj=f)
+        print("Successfully loaded ontology from local onto.owl.")
+        return onto
+    except Exception as e:
+        print(f"Failed to load local onto.owl: {e}")
+        onto.load()
+        return onto
+
+
+def save_onto():
+    """
+    Saves the ontology.
+
+    """
+    try:
+        push_to_graphdb()
+    except Exception as e:
+        print(f"Failed to push to GraphDB during save: {e}")
+
+
+def save_locally():
+    """
+    Saves the ontology into a file.
+
+    """
+    onto.save(get_onto_path())
+
+
+def search_labeled(name, kind):
+    """
+    Finds the entity labeled `name` of the given kind (ThingClass,
+    PropertyClass). The label search spans every entity, and individuals can
+    share a label with a class or property, so the kind filter is mandatory.
+    """
+    return next((match for match in onto.search(label = name) if isinstance(match, kind)), None)
+
+
+def resolve_individual(name):
+    """
+    Resolves a value to an individual by local name, or None. A value string
+    can share its name with a class or property (keys become classes), and
+    only actual individuals may be treated as nested instances.
+    """
+    ent = onto[name] if isinstance(name, str) else None
+    return ent if isinstance(ent, Thing) else None
+
+
+def get_class(name):
+    """
+    Gets or creates an OWL-class with a given name, which is used as the class URI and its label.
+
+    Args:
+        name (str): Name of the class.
+    """
+    with onto:
+        cl = search_labeled(name, ThingClass)
+        if not cl:
+            cl = types.new_class(name, (Thing,))
+            cl.label = name
+        return cl
+
+
+def get_relation(name, functional = False):
+    """
+    Gets or creates an ObjectProperty with a given name.
+
+    Args:
+        name (str): Name of the ObjectProperty.
+        functional (bool, optional): if the ObjectProperty is functional.
+    """
+    #if name == 'data':
+    #    name = 'data_'
+    name = f'has_{name}'
+    with onto:
+        # One property entity per name: a same-named property of the other kind
+        # is reused rather than re-declared, because redeclaring an existing IRI
+        # via types.new_class puns it into both kinds (invalid OWL DL).
+        rel = search_labeled(name, PropertyClass)
+        if not rel:
+            if functional:
+                rel = types.new_class(name, (ObjectProperty, FunctionalProperty))
+            else:
+                rel = types.new_class(name, (ObjectProperty,))
+            rel.label = name
+        return rel
+
+
+def get_property(name, functional = False):
+    """
+    Gets or creates a DataProperty with a given name.
+
+    Args:
+        name (str): Name of the DataProperty.
+        functional (bool, optional): if the DataProperty is functional.
+    """
+    name = f'has_{name}'
+    with onto:
+        # Same sharing rule as get_relation: never redeclare an existing name.
+        prop = search_labeled(name, PropertyClass)
+        if not prop:
+            if functional:
+                prop = types.new_class(name, (DataProperty, FunctionalProperty))
+            else:
+                prop = types.new_class(name, (DataProperty,))
+            prop.label = name
+        return prop
+
+
+def instance_name():
+    """
+    Returns a fresh unique instance name. UUID-based: the old sequential counter
+    collided with existing names after deletions, and Owlready2 silently reuses
+    an existing individual on a name collision.
+    """
+    return f"instance_{uuid.uuid4()}"
+
+
+def has_only_label(inst):
+    props = list(inst.get_properties())
+    props = [x.name for x in props]
+    return props == ['label']
+
+
+def dict_to_inst(inst, pred_name, data, functional=False):
+    obj_cl = get_class(pred_name)
+    rel = get_relation(pred_name, functional)
+    obj_inst = obj_cl(instance_name())
+    for inst_pred_name, inst_obj_data in data.items():
+        obj_inst = add_coupled_system(obj_inst, inst_pred_name, inst_obj_data)
+    # Link after populating so an empty dict still attaches the child.
+    if obj_inst not in rel[inst]:
+        rel[inst].append(obj_inst)
+
+
+def str_to_inst(inst, pred_name, label, functional=False):
+    obj_cl = get_class(pred_name)
+    rel = get_relation(pred_name, functional)
+    res = onto.search(label = label)
+    obj_inst = None
+    for item in res:
+        # Classes and properties can share the label; only individuals qualify.
+        if isinstance(item, Thing) and has_only_label(item):
+            obj_inst = item
+            break
+    if obj_inst:
+        if not obj_cl in obj_inst.is_a:
+            obj_inst.is_a.append(obj_cl)
+    else:
+        obj_inst = obj_cl(instance_name())
+        obj_inst.label = [label]
+    if obj_inst not in rel[inst]:
+        rel[inst].append(obj_inst)
+
+
+def num_to_literal(inst, pred_name, num, functional=False):
+    prop = get_property(pred_name, functional)
+    if num not in prop[inst]:
+        prop[inst].append(num)
+
+
+def add_coupled_system(inst, pred_name, obj_data):
+    """
+    Creates a coupled system with given data.
+
+    Args:
+        inst (OWL instance): OWL-instance.
+        pred_name (str): A property name from the data.
+        obj_data: Value of the property from the data.
+    """
+    with onto:
+        if type(obj_data) == dict and all([type(obj_value) == dict for obj_key, obj_value in obj_data.items()]):
+            rel = get_relation(pred_name)
+            obj_cl = get_class(pred_name)
+            for obj_key, obj_value in obj_data.items():
+                obj_inst = obj_cl(instance_name())
+                obj_inst.label = obj_key
+                for inst_pred_name, inst_obj_data in obj_value.items():
+                    obj_inst = add_coupled_system(obj_inst, inst_pred_name, inst_obj_data)
+                # Link after populating so an empty entry still attaches its child.
+                if obj_inst not in rel[inst]:
+                    rel[inst].append(obj_inst)
+        elif type(obj_data) == dict:
+            dict_to_inst(inst, pred_name, obj_data)
+        elif type(obj_data) == list:
+            for i, obj_item in enumerate(obj_data):
+                if type(obj_item) == dict:
+                    dict_to_inst(inst, pred_name, obj_item)
+                elif type(obj_item) == str:
+                    str_to_inst(inst, pred_name, obj_item)
+                else:
+                    num_to_literal(inst, pred_name, obj_item)
+        elif type(obj_data) == str:
+            str_to_inst(inst, pred_name, obj_data)
+        else:
+            num_to_literal(inst, pred_name, obj_data, True)
+
+    return inst
+
+
+def create_coupled(label):
+    """
+    Creates an OWL-instance of the coupled system class with a given label.
+
+    Args:
+        label (str): Label for the coupled system.
+
+    Returns:
+        An OWL instance for the coupled system
+    """
+    with onto:
+        coupled_system = get_class('coupled_system')
+        inst = coupled_system(instance_name())
+        inst.label = label
+    return inst.name
+
+
+def get_class_properties(class_name):
+    """
+    For a given class, returns a dictionary of its axioms.
+
+    Args:
+        class_name (str): Class name.
+
+    Returns:
+        The dictionary of the class axioms.
+    """
+    cl = onto[class_name]
+    props = []
+    for restr in cl.is_a:
+        if hasattr(restr, 'property'):
+            value = restr.value
+            if hasattr(value, 'Classes'):
+                props.append({
+                    'property': restr.property.name,
+                    'cardinality': restr.cardinality,
+                    'value': [x.name for x in value.Classes]})
+            else:
+                props.append({
+                    'property': restr.property.name,
+                    'cardinality': restr.cardinality,
+                    'value': value.__name__})
+    #props.pop('label', None)
+    return props
+
+
+def get_class_properties_recursively(class_name, depth=1, recursive=False):
+    """
+    For a given class, returns a dictionary of its axioms of the specified depth.
+
+    Args:
+        class_name (str): Class name.
+        depth (int, optional): Depth of the recursion.
+        recursive (bool, optional): If True, the depth of recursion is unlimited.
+
+    Returns:
+        The dictionary of the class axioms.
+    """
+    props = get_class_properties(class_name)
+    
+    if recursive:
+        depth = None
+    
+    if depth:
+        depth -= 1
+    
+    print(depth)
+    print(recursive)
+
+    if depth == None or depth > 0:
+        for i, item in enumerate(props):
+            if type(item['value']) == list:
+                temp_list = []
+                for value in item['value']:
+                    temp_list.append({value: get_class_properties_recursively(value, depth, recursive)})
+                    props[i]['value'] = temp_list
+    return props
+
+
+def get_subclasses(class_label):
+    """
+    For a given class, returns its subclasses.
+
+    Args:
+        class_label (str): Class label.
+
+    Returns:
+        A list of the subclass names.
+    """
+    try:
+        query = f"""
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT DISTINCT ?subClass WHERE {{
+            GRAPH <{onto_uri}> {{
+                ?class rdfs:label "{class_label}" .
+                ?subClass rdfs:subClassOf ?class .
+                FILTER (?subClass != ?class)
+            }}
+        }}
+        """
+        res = query_graphdb(query)
+        subclasses = []
+        for binding in res.get("results", {}).get("bindings", []):
+            subclass_uri = binding["subClass"]["value"]
+            subclasses.append(get_local_name(subclass_uri))
+        return subclasses
+    except Exception as e:
+        print(f"GraphDB query failed in get_subclasses: {e}. Falling back to Owlready2.")
+        cl = search_labeled(class_label, ThingClass)
+        if cl:
+            return [x.name for x in cl.subclasses()]
+        return []
+
+
+def get_instance_properties(inst_name):
+    """
+    For a given instance, returns its statements.
+
+    Args:
+        inst_name (str): Instance name.
+
+    Returns:
+        A dictionary of instance properties and their values.
+    """
+    try:
+        inst_uri = get_uri(inst_name)
+        query = f"""
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?prop ?obj ?obj_label (COUNT(?other_prop) AS ?prop_count) WHERE {{
+            GRAPH <{onto_uri}> {{
+                <{inst_uri}> ?prop ?obj .
+                FILTER (?prop != rdf:type)
+                OPTIONAL {{
+                    ?obj rdfs:label ?obj_label .
+                }}
+                OPTIONAL {{
+                    ?obj ?other_prop ?other_val .
+                    FILTER (?other_prop != rdf:type && ?other_prop != rdfs:label)
+                }}
+            }}
+        }} GROUP BY ?prop ?obj ?obj_label
+        """
+        res = query_graphdb(query)
+        
+        raw_props = {}
+        for binding in res.get("results", {}).get("bindings", []):
+            prop_uri = binding["prop"]["value"]
+            prop_name = get_local_name(prop_uri).replace('has_', '')
+            
+            obj_binding = binding["obj"]
+            obj_type = obj_binding.get("type")
+            obj_val = obj_binding["value"]
+            
+            if obj_type in ["literal", "typed-literal"]:
+                datatype = obj_binding.get("datatype")
+                if datatype == "http://www.w3.org/2001/XMLSchema#integer":
+                    val = int(obj_val)
+                elif datatype == "http://www.w3.org/2001/XMLSchema#double" or datatype == "http://www.w3.org/2001/XMLSchema#float":
+                    val = float(obj_val)
+                elif datatype == "http://www.w3.org/2001/XMLSchema#boolean":
+                    val = obj_val.lower() == "true"
+                else:
+                    if obj_val == "True":
+                        val = True
+                    elif obj_val == "False":
+                        val = False
+                    else:
+                        try:
+                            if '.' in obj_val:
+                                val = float(obj_val)
+                            else:
+                                val = int(obj_val)
+                        except ValueError:
+                            val = obj_val
+            else:
+                prop_count = int(binding.get("prop_count", {}).get("value", 0))
+                if prop_count == 0 and "obj_label" in binding:
+                    val = binding["obj_label"]["value"]
+                else:
+                    val = get_local_name(obj_val)
+            
+            if prop_name not in raw_props:
+                raw_props[prop_name] = []
+            if val not in raw_props[prop_name]:
+                raw_props[prop_name].append(val)
+                
+        props = {}
+        for prop_name, temp in raw_props.items():
+            if len(temp) == 1 and not prop_name in force_list():
+                props[prop_name] = temp[0]
+            else:
+                props[prop_name] = temp
+        return props
+    except Exception as e:
+        print(f"GraphDB query failed in get_instance_properties: {e}. Falling back to Owlready2.")
+        inst = onto[inst_name]
+        props = {}
+        for prop in inst.get_properties():
+            temp = []
+            for obj in prop[inst]:
+                if hasattr(obj, 'name'):
+                    if has_only_label(obj):
+                        temp.append(obj.label[0])
+                    else:
+                        temp.append(obj.name)
+                else:
+                    temp.append(obj)
+            prop_name = prop.name.replace('has_', '')
+            if len(temp) == 1 and not prop_name in force_list():
+                props[prop_name] = temp[0]
+            else:
+                props[prop_name] = temp
+        return props
+
+    
+def get_class_instances(class_name):
+    """
+    For a given class, returns its instances.
+
+    Args:
+        class_name (str): Name of the class.
+
+    Returns:
+        A list of class instance names.
+    """
+    try:
+        class_uri = get_uri(class_name)
+        query = f"""
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT DISTINCT ?inst WHERE {{
+            GRAPH <{onto_uri}> {{
+                ?inst rdf:type/rdfs:subClassOf* <{class_uri}> .
+            }}
+        }}
+        """
+        res = query_graphdb(query)
+        instances = []
+        for binding in res.get("results", {}).get("bindings", []):
+            inst_uri = binding["inst"]["value"]
+            instances.append(get_local_name(inst_uri))
+        return instances
+    except Exception as e:
+        print(f"GraphDB query failed in get_class_instances: {e}. Falling back to Owlready2.")
+        cl = onto[class_name]
+        if cl:
+            return [x.name for x in cl.instances()]
+        return []
+
+
+def serialize_subject(subj):
+    if isinstance(subj, str) and (subj.startswith("http://") or subj.startswith("https://")):
+        if any(char in subj for char in '<>"\' {}^`\n\r\t'):
+            raise ValueError(f"Invalid characters in subject URI: {subj}")
+        return f"<{subj}>"
+    if hasattr(subj, "name"):
+        return serialize_iri(subj.name)
+    return serialize_iri(subj)
+
+
+def get_property_iri(prop_name):
+    if prop_name == 'label':
+        return "<http://www.w3.org/2000/01/rdf-schema#label>"
+    return serialize_iri(f"has_{prop_name}")
+
+
+def is_individual_term(term):
+    """True when the serialized IRI term is typed by a project class; classes and properties carry rdf:type too and never count."""
+    query = f"""
+    ASK {{
+        GRAPH <{onto_uri}> {{
+            {term} {RDF_TYPE} ?type .
+            FILTER(STRSTARTS(STR(?type), "{get_uri('')}"))
+        }}
+    }}
+    """
+    return query_graphdb(query).get("boolean", False)
+
+
+def instance_exists(name):
+    return is_individual_term(serialize_iri(name))
+
+
+def validate_subject_exists(subj):
+    if not is_individual_term(serialize_subject(subj)):
+        raise ValueError(f"Subject instance {subj} does not exist in GraphDB.")
+
+
+def validate_class_exists_in_graphdb(class_name):
+    class_iri = serialize_iri(class_name)
+    query = f"""
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    ASK {{
+        GRAPH <http://coupled_modelling.owl> {{
+            {class_iri} a owl:Class .
+        }}
+    }}
+    """
+    res = query_graphdb(query)
+    if not res.get("boolean", False):
+        raise ValueError(f"Class {class_name} does not exist in GraphDB.")
+
+
+def is_object_property_in_graphdb(prop_name):
+    try:
+        prop_iri = serialize_iri(f"has_{prop_name}")
+        class_iri = serialize_iri(prop_name)
+    except ValueError:
+        return False
+        
+    query = f"""
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    ASK {{
+        GRAPH <http://coupled_modelling.owl> {{
+            {{ {prop_iri} a owl:ObjectProperty . }}
+            UNION
+            {{ {class_iri} a owl:Class . }}
+        }}
+    }}
+    """
+    res = query_graphdb(query)
+    return res.get("boolean", False)
+
+
+def resolve_instance_by_label(class_label, label):
+    validate_class_exists_in_graphdb(class_label)
+    class_iri = serialize_iri(class_label)
+    label_literal = serialize_literal(label)
+    query = f"""
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    SELECT ?inst WHERE {{
+        GRAPH <http://coupled_modelling.owl> {{
+            ?inst rdf:type {class_iri} .
+            ?inst rdfs:label {label_literal} .
+        }}
+    }}
+    LIMIT 1
+    """
+    res = query_graphdb(query)
+    bindings = res.get("results", {}).get("bindings", [])
+    if bindings:
+        inst_iri = bindings[0]["inst"]["value"]
+        return get_local_name(inst_iri)
+    return None
+
+
+def resolve_or_create_instance_by_label(class_label, label):
+    existing = resolve_instance_by_label(class_label, label)
+    if existing:
+        return existing
+        
+    validate_class_exists_in_graphdb(class_label)
+    class_iri = serialize_iri(class_label)
+    label_literal = serialize_literal(label)
+    new_ref_name = instance_name()
+    new_ref_iri = serialize_iri(new_ref_name)
+    
+    create_query = f"""
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    INSERT DATA {{
+        GRAPH <http://coupled_modelling.owl> {{
+            {new_ref_iri} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> {class_iri} .
+            {new_ref_iri} rdfs:label {label_literal} .
+        }}
+    }}
+    """
+    sparql_update(create_query)
+    return new_ref_name
+
+
+def resolve_val_sparql(prop_name, val):
+    if val is None:
+        return None
+    if isinstance(val, str) and not val.startswith("instance") and prop_name != "label":
+        if is_object_property_in_graphdb(prop_name):
+            return resolve_or_create_instance_by_label(prop_name, val)
+    return val
+
+
+# --- Owlready2 Mutation Helpers ---
+# Used by ontology construction, inference, creation, and copy workflows
+def add_value(subj, prop_name, value=None):
+    """
+    Adds a value to the given subject and property.
+
+    Args:
+        subj (str): A name of the instance that is the subject of the statement.
+        prop (str): Label of the property.
+        value (optional): value to add. If None, a new instance is created.
+
+    Returns:
+        The value, useful if the new instance is created.
+    """
+    subj = onto[subj]
+    if prop_name == 'label':
+        subj.label = value
+        return value
+
+    if hasattr(value, 'name'):
+        value = onto[value]
+    
+    if value == None:
+        cl = get_class(prop_name)
+        with onto:
+            value = cl(instance_name())
+        prop = get_relation(prop_name)
+        prop[subj].append(value)
+    elif type(value) == str and not value.startswith('http'):
+        if value.startswith('instance'):
+            prop = get_relation(prop_name)
+            prop[subj].append(value)
+        else:
+            value = str_to_inst(subj, prop_name, value)
+    else:
+        prop = get_property(prop_name)
+        prop[subj].append(value)
+    if hasattr(value, 'name'):
+        return value.name
+
+
+def delete_value(subj, prop, value=None):
+    """
+    Deletes a value from the given subject and property.
+
+    Args:
+        subj (str): A name of the instance that is the subject of the statement.
+        prop (str): Label of the property.
+        value (optional): value to delete. If not specified, all values are removed.
+    """
+    subj = onto[subj]
+    if value and hasattr(value, 'name'):
+        value = onto[value]
+    
+    if prop == 'label':
+        subj.label = []
+        return
+    
+    prop = onto[f'has_{prop}']
+    if value:
+        prop[subj].remove(value)
+    else:
+        prop[subj] = []            
+
+
+def replace_values(subj, data):
+    """
+    Replaces all values of the property with the specified new value for each key-value pair in the provided dictionary.
+
+    Args:
+        subj (str): A name of the instance properties of which to replace.
+        data (dict): A dictionary of property-value pairs
+    """
+    for prop, value in data.items():
+        delete_value(subj, prop)
+        add_value(subj, prop, value)
+
+
+def delete_values(inst, props):
+    for prop in props:
+        delete_value(inst, prop)
+
+
+def add_values(inst, data):
+    for prop, value in data.items():
+        add_value(inst, prop, value)
+
+
+def replace_properties(inst_name, data):
+    inst = onto[inst_name]
+    props = inst.get_properties()
+    for prop in props:
+        prop = prop.name.replace('has_', '')
+        delete_value(inst_name, prop)
+    for prop, value in data.items():
+        add_value(inst_name, prop, value)
+
+
+# --- New Direct SPARQL Mutation Helpers ---
+
+def add_value_sparql(subj, prop_name, value=None):
+    validate_subject_exists(subj)
+    
+    if value is None:
+        validate_class_exists_in_graphdb(prop_name)
+        new_inst_name = instance_name()
+        new_inst_iri = serialize_iri(new_inst_name)
+        class_iri = serialize_iri(prop_name)
+        
+        subj_iri = serialize_subject(subj)
+        pred_iri = get_property_iri(prop_name)
+        
+        query = f"""
+        INSERT DATA {{
+            GRAPH <http://coupled_modelling.owl> {{
+                {new_inst_iri} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> {class_iri} .
+                {subj_iri} {pred_iri} {new_inst_iri} .
+            }}
+        }}
+        """
+        sparql_update(query)
+        return new_inst_name
+
+    values = value if isinstance(value, list) else [value]
+    resolved_values = [resolve_val_sparql(prop_name, val) for val in values]
+    
+    # Validate each item
+    for val in resolved_values:
+        if val is None or (isinstance(val, str) and not val.startswith("instance") and prop_name != "label"):
+            if is_object_property_in_graphdb(prop_name):
+                raise ValueError("Creation of new individuals via direct SPARQL mutations is not supported except through explicit creation APIs.")
+        if isinstance(val, str) and val.startswith("instance") and not instance_exists(val):
+            raise ValueError(f"Referenced instance {val} does not exist in GraphDB.")
+            
+    subj_iri = serialize_subject(subj)
+    pred_iri = get_property_iri(prop_name)
+    
+    triples = []
+    for val in resolved_values:
+        if val is not None:
+            obj_val = serialize_object(val)
+            triples.append(f"{subj_iri} {pred_iri} {obj_val} .")
+            
+    if triples:
+        query = f"""
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        INSERT DATA {{
+            GRAPH <http://coupled_modelling.owl> {{
+                {" ".join(triples)}
+            }}
+        }}
+        """
+        sparql_update(query)
+    return resolved_values if isinstance(value, list) else resolved_values[0]
+
+
+def link_target(value):
+    """The instance id an object-link value points at; None for literals and delete-all."""
+    if isinstance(value, dict):
+        return value.get("id") if value.get("kind") == "object" else None
+    if isinstance(value, str) and value.startswith("instance"):
+        return value
+    return None
+
+
+def delete_value_sparql(subj, prop_name, value=None, cascade=True):
+    """Deletes one value (all when None); with `cascade` an unlinked instance goes with its owned subtree when nothing else reaches it. Returns {target, deleted, kept}."""
+    validate_subject_exists(subj)
+    subj_iri = serialize_subject(subj)
+    pred_iri = get_property_iri(prop_name)
+
+    if value is None:
+        query = f"""
+        DELETE WHERE {{
+            GRAPH <{onto_uri}> {{
+                {subj_iri} {pred_iri} ?old_val .
+            }}
+        }}
+        """
+    elif isinstance(value, dict) and ("kind" in value or "value" in value or "id" in value):
+        # Deletions must also match dangling references and non-canonical lexical
+        # forms ("1.50"^^xsd:double vs "1.5"), so: no existence check, and matching
+        # by SPARQL value equality instead of exact-term DELETE DATA.
+        obj_term = serialize_metadata_value(value, require_existing=False)
+        query = f"""
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        DELETE {{
+            GRAPH <{onto_uri}> {{
+                {subj_iri} {pred_iri} ?old_val .
+            }}
+        }}
+        WHERE {{
+            GRAPH <{onto_uri}> {{
+                {subj_iri} {pred_iri} ?old_val .
+                FILTER(?old_val = {obj_term})
+            }}
+        }}
+        """
+    else:
+        query = f"""
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        DELETE DATA {{
+            GRAPH <{onto_uri}> {{
+                {subj_iri} {pred_iri} {serialize_object(value)} .
+            }}
+        }}
+        """
+
+    result, owned = unlink_sets(subj, prop_name, link_target(value), cascade)
+    sparql_update(";\n".join([query, *delete_individuals_operations(owned)]))
+    return result
+
+
+
+def replace_value_sparql(subj, prop_name, old_value, new_value):
+    """
+    Atomically replaces one specific property value with another in a single
+    SPARQL update, so a failure can never leave the value half-replaced.
+
+    Both values are typed terms ({kind: object|literal, ...}): the old term is
+    matched by value equality (and may reference a dangling instance), the new
+    term keeps its exact datatype/language tag. If the old value no longer
+    exists, the update is a no-op rather than an insert.
+    """
+    validate_subject_exists(subj)
+    if old_value is None or new_value is None:
+        raise ValueError("old_value and new_value parameters are required.")
+
+    subj_iri = serialize_subject(subj)
+    pred_iri = get_property_iri(prop_name)
+    old_term = serialize_metadata_value(old_value, require_existing=False)
+    new_term = serialize_metadata_value(new_value)
+
+    query = f"""
+    PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+    DELETE {{
+        GRAPH <http://coupled_modelling.owl> {{
+            {subj_iri} {pred_iri} ?old_val .
+        }}
+    }}
+    INSERT {{
+        GRAPH <http://coupled_modelling.owl> {{
+            {subj_iri} {pred_iri} {new_term} .
+        }}
+    }}
+    WHERE {{
+        GRAPH <http://coupled_modelling.owl> {{
+            {subj_iri} {pred_iri} ?old_val .
+            FILTER(?old_val = {old_term})
+        }}
+    }}
+    """
+    sparql_update(query)
+
+
+def replace_values_sparql(subj, data):
+    """
+    Replaces all values of the property with the specified new value for each key-value pair in data.
+    
+    Note: Direct implicit creation is currently supported through add_value_sparql() 
+    and create_instance_sparql(), not this batch replacement API.
+    """
+    validate_subject_exists(subj)
+    
+    # Upfront validation for all properties
+    for prop_name, value in data.items():
+        values = value if isinstance(value, list) else [value]
+        for val in values:
+            if val is None or (isinstance(val, str) and not val.startswith("instance") and prop_name != "label"):
+                raise ValueError("Creation of new individuals via direct SPARQL mutations is not supported except through explicit creation APIs.")
+            if isinstance(val, str) and val.startswith("instance") and not instance_exists(val):
+                raise ValueError(f"Referenced instance {val} does not exist in GraphDB.")
+                
+    subj_iri = serialize_subject(subj)
+    delete_triples = []
+    insert_triples = []
+    where_clauses = []
+    
+    for idx, (prop_name, value) in enumerate(data.items()):
+        pred_iri = get_property_iri(prop_name)
+        values = value if isinstance(value, list) else [value]
+        
+        var_name = f"old_{idx}"
+        delete_triples.append(f"{subj_iri} {pred_iri} ?{var_name} .")
+        where_clauses.append(f"OPTIONAL {{ {subj_iri} {pred_iri} ?{var_name} . }}")
+        
+        for val in values:
+            if val is not None:
+                obj_val = serialize_object(val)
+                insert_triples.append(f"{subj_iri} {pred_iri} {obj_val} .")
+                
+    if insert_triples:
+        query = f"""
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        DELETE {{
+            GRAPH <http://coupled_modelling.owl> {{
+                {" ".join(delete_triples)}
+            }}
+        }}
+        INSERT {{
+            GRAPH <http://coupled_modelling.owl> {{
+                {" ".join(insert_triples)}
+            }}
+        }}
+        WHERE {{
+            GRAPH <http://coupled_modelling.owl> {{
+                {" ".join(where_clauses)}
+            }}
+        }}
+        """
+    else:
+        query = f"""
+        DELETE {{
+            GRAPH <http://coupled_modelling.owl> {{
+                {" ".join(delete_triples)}
+            }}
+        }}
+        WHERE {{
+            GRAPH <http://coupled_modelling.owl> {{
+                {" ".join(where_clauses)}
+            }}
+        }}
+        """
+    sparql_update(query)
+
+
+def delete_values_sparql(inst, props):
+    # Idempotent delete on subject: no error raised if subject doesn't exist
+    subj_iri = serialize_subject(inst)
+    operations = []
+    
+    for idx, prop_name in enumerate(props):
+        pred_iri = get_property_iri(prop_name)
+        operations.append(f"""
+        DELETE WHERE {{
+            GRAPH <http://coupled_modelling.owl> {{
+                {subj_iri} {pred_iri} ?old_{idx} .
+            }}
+        }}
+        """)
+        
+    query = " ; ".join(operations)
+    sparql_update(query)
+
+
+def add_values_sparql(inst, data):
+    """
+    Adds values to the given subject instance from a dictionary of property-value pairs.
+
+    Plain string values are kept as literals for datatype properties; for object
+    properties they are resolved to an existing instance of the property's class by
+    label, or a new labeled instance is created inside the same SPARQL update.
+    Null values and dangling instance references are rejected before anything is
+    written, so a failed request leaves no trace in GraphDB.
+    """
+    validate_subject_exists(inst)
+
+    # Read-only pass: validate every value and resolve labels to object
+    # references. New labeled instances are only collected as triples here and
+    # created together with the subject triples in the single update below.
+    resolved_data = {}
+    creation_triples = []
+    pending_creations = {}
+    for prop_name, value in data.items():
+        values = value if isinstance(value, list) else [value]
+        object_property = None  # one classification query per property
+        resolved_values = []
+        for val in values:
+            if val is None:
+                raise ValueError(f"Null value for property '{prop_name}' is not supported; send a literal or an instance reference.")
+            if isinstance(val, str) and val.startswith("instance"):
+                if not instance_exists(val):
+                    raise ValueError(f"Referenced instance {val} does not exist in GraphDB.")
+            elif isinstance(val, str) and prop_name != "label":
+                if object_property is None:
+                    object_property = is_object_property_in_graphdb(prop_name)
+                if object_property:
+                    existing = resolve_instance_by_label(prop_name, val) or pending_creations.get((prop_name, val))
+                    if existing is None:
+                        new_ref = instance_name()
+                        new_iri = serialize_iri(new_ref)
+                        creation_triples.append(f"{new_iri} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> {serialize_iri(prop_name)} .")
+                        creation_triples.append(f"{new_iri} {get_property_iri('label')} {serialize_literal(val)} .")
+                        pending_creations[(prop_name, val)] = new_ref
+                        existing = new_ref
+                    val = existing
+            resolved_values.append(val)
+        resolved_data[prop_name] = resolved_values
+
+    subj_iri = serialize_subject(inst)
+    triples = list(creation_triples)
+
+    for prop_name, values in resolved_data.items():
+        pred_iri = get_property_iri(prop_name)
+        for val in values:
+            obj_val = serialize_object(val)
+            triples.append(f"{subj_iri} {pred_iri} {obj_val} .")
+
+    if triples:
+        query = f"""
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        INSERT DATA {{
+            GRAPH <http://coupled_modelling.owl> {{
+                {" ".join(triples)}
+            }}
+        }}
+        """
+        sparql_update(query)
+
+
+def replace_properties_sparql(inst_name, data):
+    """
+    Replaces properties of the given instance.
+    
+    Note: Direct implicit creation is currently supported through add_value_sparql() 
+    and create_instance_sparql(), not this batch replacement API.
+    """
+    validate_subject_exists(inst_name)
+    
+    # Upfront validation for all properties
+    for prop_name, value in data.items():
+        values = value if isinstance(value, list) else [value]
+        for val in values:
+            if val is None or (isinstance(val, str) and not val.startswith("instance") and prop_name != "label"):
+                raise ValueError("Creation of new individuals via direct SPARQL mutations is not supported except through explicit creation APIs.")
+            if isinstance(val, str) and val.startswith("instance") and not instance_exists(val):
+                raise ValueError(f"Referenced instance {val} does not exist in GraphDB.")
+                
+    subj_iri = serialize_subject(inst_name)
+    insert_triples = []
+    
+    for prop_name, value in data.items():
+        pred_iri = get_property_iri(prop_name)
+        values = value if isinstance(value, list) else [value]
+        for val in values:
+            if val is not None:
+                obj_val = serialize_object(val)
+                insert_triples.append(f"{subj_iri} {pred_iri} {obj_val} .")
+        
+    query = f"""
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+    DELETE {{
+        GRAPH <http://coupled_modelling.owl> {{
+            {subj_iri} ?p ?o .
+        }}
+    }}
+    WHERE {{
+        GRAPH <http://coupled_modelling.owl> {{
+            {subj_iri} ?p ?o .
+            FILTER(
+                STRSTARTS(STR(?p), "http://coupled_modelling.owl#has_")
+                || ?p = rdfs:label
+            )
+        }}
+    }}
+    """
+    if insert_triples:
+        query += f""" ;
+        INSERT DATA {{
+            GRAPH <http://coupled_modelling.owl> {{
+                {" ".join(insert_triples)}
+            }}
+        }}
+        """
+    sparql_update(query)
+
+
+def create_instance_sparql(prop_name, parent, data=None):
+    validate_subject_exists(parent)
+    validate_class_exists_in_graphdb(prop_name)
+    
+    # Generate UUID for the new instance
+    new_inst_name = instance_name()
+    new_inst_iri = serialize_iri(new_inst_name)
+    
+    # Retrieve range class of the property
+    class_iri = serialize_iri(prop_name)
+    
+    parent_iri = serialize_subject(parent)
+    pred_iri = get_property_iri(prop_name)
+    
+    triples = [
+        f"{new_inst_iri} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> {class_iri} .",
+        f"{parent_iri} {pred_iri} {new_inst_iri} ."
+    ]
+    
+    if data:
+        # Preprocess / resolve labels to object references
+        resolved_data = {}
+        for prop, val in data.items():
+            if isinstance(val, list):
+                resolved_data[prop] = [resolve_val_sparql(prop, v) for v in val]
+            else:
+                resolved_data[prop] = resolve_val_sparql(prop, val)
+                
+        # Upfront validation for data properties
+        for prop, val in resolved_data.items():
+            values = val if isinstance(val, list) else [val]
+            for v in values:
+                if v is None or (isinstance(v, str) and not v.startswith("instance") and prop != "label"):
+                    if is_object_property_in_graphdb(prop):
+                        raise ValueError("Creation of nested individuals via direct SPARQL mutations is not supported except through explicit creation APIs.")
+                if isinstance(v, str) and v.startswith("instance") and not instance_exists(v):
+                    raise ValueError(f"Referenced instance {v} does not exist in GraphDB.")
+                    
+        for prop, val in resolved_data.items():
+            p_iri = get_property_iri(prop)
+            values = val if isinstance(val, list) else [val]
+            for v in values:
+                if v is not None:
+                    obj_val = serialize_object(v)
+                    triples.append(f"{new_inst_iri} {p_iri} {obj_val} .")
+                    
+    query = f"""
+    PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+    INSERT DATA {{
+        GRAPH <http://coupled_modelling.owl> {{
+            {" ".join(triples)}
+        }}
+    }}
+    """
+    sparql_update(query)
+    return new_inst_name
+
+
+def create_class_instance_sparql(class_name, label):
+    """Creates a standalone class instance with rdfs:label in GraphDB."""
+    validate_class_exists_in_graphdb(class_name)
+    new_name = instance_name()
+    new_iri = serialize_iri(new_name)
+    class_iri = serialize_iri(class_name)
+    label_iri = get_property_iri("label")
+    label_lit = serialize_literal(label)
+    query = f"""
+    INSERT DATA {{
+        GRAPH <http://coupled_modelling.owl> {{
+            {new_iri} <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> {class_iri} .
+            {new_iri} {label_iri} {label_lit} .
+        }}
+    }}
+    """
+    sparql_update(query)
+    return new_name
+
+
+def _instance_links(iris, bound):
+    """Yields (subject, predicate, object, is_coupled_system) for the `has_*` links between individuals touching the IRIs, VALUES bound on 's' or 'o'."""
+    ns = get_uri('')
+    for batch in chunked(iris):
+        values = " ".join(f"<{iri}>" for iri in batch)
+        query = f"""
+        SELECT DISTINCT ?s ?p ?o (BOUND(?cs) AS ?coupled) WHERE {{
+            GRAPH <{onto_uri}> {{
+                VALUES ?{bound} {{ {values} }}
+                ?s ?p ?o .
+                FILTER(isIRI(?o) && STRSTARTS(STR(?p), "{ns}has_"))
+                ?s {RDF_TYPE} ?st . FILTER(STRSTARTS(STR(?st), "{ns}"))
+                ?o {RDF_TYPE} ?ot . FILTER(STRSTARTS(STR(?ot), "{ns}"))
+                OPTIONAL {{ ?o {RDF_TYPE} ?cs . ?cs <http://www.w3.org/2000/01/rdf-schema#subClassOf>* {serialize_iri('coupled_system')} . }}
+            }}
+        }}
+        """
+        for binding in query_graphdb(query).get("results", {}).get("bindings", []):
+            yield binding["s"]["value"], binding["p"]["value"], binding["o"]["value"], binding["coupled"]["value"] == "true"
+
+
+def _reachable_children(root):
+    """The `has_*` closure below `root` as (children, boundaries); coupled systems are boundaries and never expanded."""
+    children = {root: set()}
+    boundaries = set()
+    frontier = [root]
+    while frontier:
+        discovered = []
+        for parent, _, child, is_coupled_system in _instance_links(frontier, 's'):
+            children[parent].add(child)
+            if child in children:
+                continue
+            children[child] = set()
+            if is_coupled_system:
+                boundaries.add(child)
+            else:
+                discovered.append(child)
+        frontier = discovered
+    return children, boundaries
+
+
+def partition_subtree(root, children, incoming, boundaries=()):
+    """
+    Pure split of the nodes reachable from `root` (`children`: node -> linked nodes,
+    one entry per reachable node) given the `incoming` (subject, object) links into
+    them and the `boundaries` (reachable nodes that are never owned, e.g. coupled
+    systems). Returns (owned, kept, unlinked_from): `owned` goes with the root; `kept`
+    holds every node still reachable from outside the subtree, i.e. a boundary or a
+    node linked from elsewhere, plus everything below it, never passing through the
+    root; `unlinked_from` are the surviving nodes whose link to the root is removed.
+    """
+    reachable = set(children)
+    incoming = list(incoming)
+    anchors = set(boundaries) - {root}
+    # A link from outside the subtree, or from a boundary (whose branch is not ours), protects its target.
+    anchors.update(obj for subject, obj in incoming if (subject not in reachable or subject in anchors) and obj != root)
+    kept = set()
+    stack = list(anchors)
+    while stack:
+        node = stack.pop()
+        if node in kept or node == root:
+            continue
+        kept.add(node)
+        stack.extend(children[node])
+    owned = [root] + sorted(reachable - kept - {root})
+    owned_set = set(owned)
+    unlinked_from = {subject for subject, obj in incoming if obj == root and subject not in owned_set}
+    return owned, sorted(kept), sorted(unlinked_from)
+
+
+def partition_unlinked(holder, target, children, incoming, boundaries=()):
+    """Pure split for removing the link `holder` -> `target` (`incoming` excludes it); the holder is an anchor. Returns (owned, kept), a surviving target in `kept` alone."""
+    if target == holder or target in boundaries:
+        return [], [target]
+    anchors = set(boundaries) | ({holder} if holder in children else set())
+    owned, kept, referrers = partition_subtree(target, children, incoming, anchors)
+    # A surviving referrer means an outside path still reaches the target.
+    return ([], [target]) if referrers else (owned, kept)
+
+
+def collect_deletion_sets(root, cascade=True):
+    """The owned/kept/unlinked_from split for deleting the individual IRI `root`."""
+    children, boundaries = _reachable_children(root) if cascade else ({root: set()}, set())
+    incoming = ((subject, obj) for subject, _, obj, _ in _instance_links(list(children), 'o'))
+    return partition_subtree(root, children, incoming, boundaries)
+
+
+def collect_unlink_sets(holder, predicate, target):
+    """The owned/kept split for removing the link between the individual IRIs; a link that is not stored collects nothing."""
+    removed = (holder, predicate, target)
+    # The links into the target say whether the removed one is stored and whether the target is a coupled system.
+    into_target = {(subject, pred, obj): is_coupled_system for subject, pred, obj, is_coupled_system in _instance_links([target], 'o')}
+    if removed not in into_target or into_target[removed]:
+        return [], [target]
+    children, boundaries = _reachable_children(target)
+    incoming = [(subject, obj) for subject, pred, obj, _ in _instance_links(list(children), 'o') if (subject, pred, obj) != removed]
+    return partition_unlinked(holder, target, children, incoming, boundaries)
+
+
+def unlink_sets(subj, prop_name, target, cascade=True):
+    """The {target, deleted, kept} result plus the owned IRIs for removing the link `subj` -has_prop-> `target`; a non-individual target is in neither set."""
+    predicate = term_iri(get_property_iri(prop_name))
+    result = {"target": target, "deleted": [], "kept": []}
+    if target is None or not instance_exists(target):
+        return result, []
+    if not cascade:
+        result["kept"] = [target]
+        return result, []
+    holder = term_iri(serialize_subject(subj))
+    owned, kept = collect_unlink_sets(holder, predicate, term_iri(serialize_iri(target)))
+    result["deleted"] = [get_local_name(iri) for iri in owned]
+    result["kept"] = [get_local_name(iri) for iri in kept]
+    return result, owned
+
+
+def delete_individuals_operations(iris):
+    """SPARQL operations removing every outgoing and incoming triple of the IRIs, in bounded VALUES blocks."""
+    operations = []
+    for batch in chunked(list(iris)):
+        values = " ".join(f"<{iri}>" for iri in batch)
+        operations.append(f"""
+        DELETE {{
+            GRAPH <{onto_uri}> {{
+                ?x ?p ?o .
+                ?s ?q ?x .
+            }}
+        }}
+        WHERE {{
+            GRAPH <{onto_uri}> {{
+                VALUES ?x {{ {values} }}
+                {{ ?x ?p ?o . }} UNION {{ ?s ?q ?x . }}
+            }}
+        }}
+        """)
+    return operations
+
+
+def get_instance_deletion_preview(instance_name, cascade=True):
+    """Read-only counterpart of a deletion."""
+    return delete_instance_sparql(instance_name, cascade=cascade, dry_run=True)
+
+
+def get_value_deletion_preview(instance_name, prop_name, target):
+    """Read-only counterpart of `delete_value_sparql` for an object link."""
+    validate_subject_exists(instance_name)
+    result, _ = unlink_sets(instance_name, prop_name, target)
+    return result
+
+
+def delete_instance_sparql(instance_name, cascade=True, dry_run=False):
+    """
+    Deletes an individual with every outgoing and incoming triple. With `cascade`
+    (the default) its owned subtree goes with it; with `dry_run` nothing is deleted.
+
+    Returns:
+        dict with `instance`, the `deleted` local names (the instance first), the
+        `kept` ones still reachable from outside the subtree, and `unlinked_from`:
+        surviving instances whose link to the deleted instance is removed.
+    """
+    if not instance_name:
+        raise ValueError("instance_name parameter is required.")
+    if not instance_exists(instance_name):
+        raise ValueError(f"Instance {instance_name} does not exist in GraphDB.")
+    root = term_iri(serialize_iri(instance_name))
+
+    owned, kept, referrers = collect_deletion_sets(root, cascade)
+    result = {
+        "instance": instance_name,
+        "deleted": [get_local_name(iri) for iri in owned],
+        "kept": [get_local_name(iri) for iri in kept],
+        "unlinked_from": [get_local_name(iri) for iri in referrers],
+    }
+    if dry_run:
+        return result
+
+    # One request, several operations: still one transaction.
+    sparql_update(";\n".join(delete_individuals_operations(owned)))
+    return result
+
+
+
+def get_instance_properties_recursively(inst_name, depth=1, recursive=False):
+    """
+    Get instance properties and its subproperties recursively.
+
+    Args:
+        inst_name (str): Instance name.
+        depth (int, optional): Depth of the recursion.
+        recursive (bool, optional): If True, the depth of recursion is unlimited.
+
+    Returns:
+        Dictionary of nested properties.
+    """
+    props = get_instance_properties(inst_name)
+
+    if recursive == True:
+        depth = None
+
+    if depth:
+        depth -= 1
+    
+    if depth == None or depth > 0:                    
+        for key, items in props.items():
+            if type(items) == list:
+                temp_list = []
+                for item in items:
+                    if resolve_individual(item) is not None:
+                        temp_list.append({item: get_instance_properties_recursively(item, depth, recursive)})
+                    else:
+                        temp_list.append(item)
+                props[key] = temp_list
+            else:
+                if resolve_individual(items) is not None:
+                    props[key] = {items: get_instance_properties_recursively(items, depth, recursive)}
+                else:
+                    props[key] = items
+    return props
+
+
+def create_instance(prop, parent, data=None):
+    inst = add_value(parent, prop)
+    if data:
+        for prop, value in data.items():
+            add_value(inst, prop, value)
+    return inst
+
+
+def copy_instance(inst, parent=None, data=None):
+    """
+    Creates a structural copy of a given instance with all its properties.
+
+    Args:
+        inst_name (str): Instance name.
+        parent_name (str, optional): Name of the parent instance.
+
+    Returns:
+        Created instance.
+    """
+    with onto:
+        inst = onto[inst]
+        cl = type(inst)
+        new_inst = cl(instance_name())
+
+        if parent:
+            parent = onto[parent]
+            prop = None
+            for subj, p in inst.get_inverse_properties():
+                prop = p
+                if isinstance(subj, type(parent)):
+                    break
+            if prop is not None:
+                prop[parent].append(new_inst)
+            else:
+                raise ValueError(f"Could not find any inverse property on {inst.name} to connect to parent {parent.name}")
+        
+        if data:
+            new_props = data.keys()
+        
+        for prop in inst.get_properties():
+            
+            if data:
+                if prop.name.replace('has_', '') in new_props:
+                    continue
+
+            objects = prop[inst]
+            for obj in objects:
+                if hasattr(obj, 'name'):
+                    if not has_only_label(obj):
+                        continue
+                prop[new_inst].append(obj)
+        
+        if data:
+            for prop, value in data.items():
+                add_value(new_inst.name, prop, value)
+        
+        return new_inst.name
+
+
+def copy_instance_recursively(inst, parent=None, data=None, depth=1, recursive=False, is_top=True):
+    """
+    Creates a structural copy of a given instance with all it properties revursively.
+
+    Args:
+        inst_name (str): Instance name.
+
+    Returns:
+        Created instance.
+    """
+    with onto:
+        new_inst = copy_instance(inst, parent, data)
+        new_inst = onto[new_inst]
+        inst = onto[inst]
+        
+        if recursive == True:
+            depth = None
+
+        if depth:
+            depth -= 1
+
+        if depth == None or depth > 0:
+            for prop in inst.get_properties():
+                objects = prop[inst]
+                for obj in objects:
+                    if hasattr(obj, 'name'):
+                        if not has_only_label(obj):
+                            obj = copy_instance_recursively(obj.name, depth=depth, recursive=recursive, is_top=False)
+                            obj = onto[obj]
+                            prop[new_inst].append(obj)
+        return new_inst.name
+
+
+def export_coupled_kratos(coupled_system):
+    """
+    Returns a coupled system in Kratos format.
+
+    Args:
+        coupled_system_name (str): Name of the coupled system.
+
+    Returns:
+        Dictionary of nested properties.
+    """
+    props = get_instance_properties(coupled_system)
+    label = props.get('label')
+    if label:
+        props.pop('label', None)
+    root = resolve_individual(coupled_system)
+    if root is not None and 'coupled_system' in str(type(root).name):
+        label = None
+    result = props.pop('result', None)
+
+    def export_value(value):
+        ent = resolve_individual(value)
+        if ent is None:
+            return value
+        if has_only_label(ent):
+            return ent.label[0]
+        return export_coupled_kratos(value)
+
+    for key, items in props.items():
+        if type(items) == list and len(items) > 1 and key in force_dict():
+            temp_dict = {}
+            for item in items:
+                if resolve_individual(item) is None:
+                    temp_dict[str(item)] = item
+                    continue
+                obj_props = export_coupled_kratos(item)
+                if obj_props:
+                    temp_dict[list(obj_props.keys())[0]] = list(obj_props.values())[0]
+            props[key] = temp_dict
+        elif (type(items) == list and len(items) > 1) or key in force_list():
+            props[key] = [export_value(item) for item in items]
+        else:
+            props[key] = export_value(items)
+    if label:
+        props = {label: props}
+    label = None
+    return props
+
+
+FORCE_DICT_KEYS = frozenset({'solvers', 'data'})
+
+FORCE_LIST_KEYS = frozenset({
+    'convergence_accelerators',
+    'convergence_criteria',
+    'input_data_list',
+    'output_data_list',
+    'export_data',
+    'import_data',
+    'import_meshes',
+    'data_transfer_operator_options',
+})
+
+
+def force_dict():
+    return FORCE_DICT_KEYS
+
+
+def force_list():
+    return FORCE_LIST_KEYS
+
+
+def get_connected_instances_recursively(inst_name, insts, depth, path=frozenset()):
+    """
+    Collects the instances reachable from `inst_name` into `insts` in place.
+
+    Keeps the MAXIMUM depth per instance so a shared instance always ends up
+    deeper than every parent — infer_class_properties_recursively processes
+    deepest-first and needs children inferred before their parents.
+
+    Args:
+        inst_name (str): Instance name.
+        insts (dict): Maps each visited instance to its maximal depth; mutated in place.
+        depth (int): Depth of the current visit.
+        path (frozenset): Instances on the current descent, to cut cycles.
+    """
+    inst = onto[inst_name]
+    if inst in path:
+        return
+    if inst in insts and insts[inst] >= depth:
+        return
+    insts[inst] = depth
+    child_path = path | {inst}
+    depth += 1
+    for prop in inst.get_properties():
+        for value in prop[inst]:
+            if hasattr(value, 'name'):
+                get_connected_instances_recursively(value.name, insts, depth, child_path)
+
+
+def infer_class_properties(inst):
+    """
+    Infers new classes and axioms from a given instance.
+
+    Args:
+        inst (OWL instance): OWL-instance to infer from.
+    """
+    new_props = []
+    for rel in inst.get_properties():
+        if str(rel) == 'rdf-schema.label':
+            continue
+        for obj in rel[inst]:
+            if hasattr(obj, 'is_a'):
+                new_props.append((rel, And(obj.is_a)))
+            else:
+                new_props.append((rel, type(obj)))
+    new_props = Counter(new_props)
+    if not(len(new_props)):
+        return
+    new_classes = []
+    for cl in inst.is_a:
+        match = False
+        subclasses = list(cl.subclasses())
+        subclasses.append(cl)
+        for sub_cl in subclasses:
+            old_props = {}
+            for x in sub_cl.is_a:
+                if hasattr(x, 'property') and hasattr(x, 'value'):
+                    old_props[(x.property, x.value)] = x.cardinality
+            #old_props.pop('rdf-schema.label', None)
+            if old_props == new_props:
+                match = True
+                #if sub_cl not in inst.is_a:
+                new_classes.append(sub_cl)
+                break
+        if not match:
+            n = len(list(cl.subclasses())) + 1
+            new_cl = types.new_class(f'{cl.name}_{n}', (cl,))
+            for (rel, obj_cl), card in new_props.items():
+                new_cl.is_a.append(rel.exactly(card, obj_cl))
+            #inst.is_a.remove(cl)
+            new_classes.append(new_cl)
+    inst.is_a = new_classes
+
+
+def infer_class_properties_recursively(insts):
+    max_depth = max([x for x in insts.values()])
+    for inst, depth in list(insts.items()):
+        if depth == max_depth:
+            infer_class_properties(inst)
+            del insts[inst]
+    if len(insts):
+        infer_class_properties_recursively(insts)
+
+
+def infer_coupled_system_structure(coupled_system):
+    insts = {}
+    get_connected_instances_recursively(coupled_system, insts, 0)
+    infer_class_properties_recursively(insts)
+
+
+def import_coupled_kratos(data, label):
+    """
+    Recursively creates an OWL-instance of the coupled system class with given data and label.
+
+    Args:
+        data: Dictionary with the coupled system data.
+        label: Label of the coupled system.
+
+    Returns:
+        The OWL-instance of the coupled system.
+    """
+    inst_name = create_coupled(label)
+    inst = onto[inst_name]
+    for pred_name, obj_data in data.items():
+        inst = add_coupled_system(inst, pred_name, obj_data)
+    infer_coupled_system_structure(inst_name)
+    return inst_name
+
+
+def get_class_hierarchy():
+    """
+    Returns a dictionary mapping root classes to their subclasses.
+    """
+    try:
+        query = f"""
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        SELECT DISTINCT ?class ?subClass WHERE {{
+            GRAPH <{onto_uri}> {{
+                ?class rdf:type owl:Class .
+                FILTER (STRSTARTS(STR(?class), "http://coupled_modelling.owl#"))
+                FILTER NOT EXISTS {{
+                    ?class rdfs:subClassOf ?parent .
+                    FILTER (?parent != owl:Thing && ?parent != ?class && STRSTARTS(STR(?parent), "http://coupled_modelling.owl#"))
+                }}
+                OPTIONAL {{
+                    ?subClass rdfs:subClassOf ?class .
+                    FILTER (?subClass != ?class)
+                }}
+            }}
+        }}
+        """
+        res = query_graphdb(query)
+        hierarchy = {}
+        for binding in res.get("results", {}).get("bindings", []):
+            class_name = get_local_name(binding["class"]["value"])
+            if class_name not in hierarchy:
+                hierarchy[class_name] = []
+            if "subClass" in binding:
+                subclass_name = get_local_name(binding["subClass"]["value"])
+                if subclass_name not in hierarchy[class_name]:
+                    hierarchy[class_name].append(subclass_name)
+        return hierarchy
+    except Exception as e:
+        print(f"GraphDB query failed in get_class_hierarchy: {e}. Falling back to Owlready2.")
+        res = {}
+        for cl in onto.classes():
+            if cl.is_a == [Thing]:
+                res[cl.name] = [x.name for x in cl.subclasses()]
+        return res
+
+def get_graphdb_health():
+    """
+    Checks the health of the GraphDB connection and repository.
+    Returns:
+        dict: A dictionary containing health details.
+    Raises:
+        GraphDBError: If the repository or GraphDB is offline.
+    """
+    query = "ASK { ?s ?p ?o }"
+    try:
+        query_graphdb(query)
+        return {
+            "status": "ok",
+            "graphdb": "connected",
+            "repository": REPOSITORY
+        }
+    except Exception as e:
+        if isinstance(e, GraphDBError):
+            raise
+        raise GraphDBError(f"Health check failed: {e}") from e
+
+
+def select_preferred_label(labels, fallback):
+    """
+    Sorts labels prioritizing English, then untagged, then other languages,
+    followed by case-insensitive lexical sorting.
+    """
+    if not labels:
+        return fallback
+    ordered = sorted(
+        labels,
+        key=lambda item: (
+            0 if item[0].lower() == "en" else
+            1 if item[0] == "" else
+            2,
+            item[0].lower(),
+            item[1].casefold()
+        )
+    )
+    return ordered[0][1]
+
+
+def get_class_hierarchy_metadata():
+    """
+    Returns the complete class list with parent arrays, filtered for project local classes.
+    """
+    query = f"""
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    SELECT DISTINCT ?class ?parent WHERE {{
+        GRAPH <{onto_uri}> {{
+            ?class rdf:type owl:Class .
+            FILTER (STRSTARTS(STR(?class), "http://coupled_modelling.owl#"))
+            OPTIONAL {{
+                ?class rdfs:subClassOf ?parent .
+                FILTER (?parent != owl:Thing && ?parent != ?class && STRSTARTS(STR(?parent), "http://coupled_modelling.owl#"))
+            }}
+        }}
+    }}
+    """
+    res = query_graphdb(query)
+    class_parents = {}
+    for binding in res.get("results", {}).get("bindings", []):
+        class_name = get_local_name(binding["class"]["value"])
+        if class_name not in class_parents:
+            class_parents[class_name] = set()
+        if "parent" in binding:
+            parent_name = get_local_name(binding["parent"]["value"])
+            class_parents[class_name].add(parent_name)
+            
+    result = []
+    for cl_name, parents in class_parents.items():
+        result.append({
+            "class": cl_name,
+            "parents": sorted(list(parents))
+        })
+    result.sort(key=lambda x: x["class"])
+    return result
+
+
+PREVIEW_LIMIT = 3
+
+# Keeps batched VALUES clauses bounded for hub instances with many links.
+BATCH_QUERY_CHUNK = 200
+
+
+def coerce_literal(value, datatype):
+    """Converts a SPARQL literal's lexical form to the matching Python type."""
+    if datatype == "http://www.w3.org/2001/XMLSchema#boolean":
+        return value.lower() == "true"
+    if datatype == "http://www.w3.org/2001/XMLSchema#integer":
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if datatype in (
+        "http://www.w3.org/2001/XMLSchema#double",
+        "http://www.w3.org/2001/XMLSchema#float",
+        "http://www.w3.org/2001/XMLSchema#decimal",
+    ):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
+
+
+def chunked(items, size=BATCH_QUERY_CHUNK):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def collect_preview_candidates(inst_ids):
+    """
+    Batched preview collection: for every given instance id, its outgoing
+    statements (minus rdf:type / rdfs:label) with object labels resolved.
+    Returns {inst_id: [{"property", "value", "kind"}, ...]}.
+    """
+    if not inst_ids:
+        return {}
+
+    groups_by_inst = {inst_id: {} for inst_id in inst_ids}
+    for chunk in chunked(list(inst_ids)):
+        uris_str = " ".join(f"<{get_uri(inst_id)}>" for inst_id in chunk)
+        prop_query = f"""
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?inst ?prop ?obj ?obj_label (LANG(?obj_label) AS ?obj_lang) WHERE {{
+            GRAPH <{onto_uri}> {{
+                VALUES ?inst {{ {uris_str} }}
+                ?inst ?prop ?obj .
+                FILTER (?prop != rdf:type && ?prop != rdfs:label)
+                OPTIONAL {{
+                    FILTER(isIRI(?obj))
+                    ?obj rdfs:label ?obj_label .
+                }}
+            }}
+        }}
+        """
+        prop_res = query_graphdb(prop_query)
+
+        for binding in prop_res.get("results", {}).get("bindings", []):
+            inst_id = get_local_name(binding["inst"]["value"])
+            if inst_id not in groups_by_inst:
+                continue
+
+            prop_uri = binding["prop"]["value"]
+            if prop_uri in (
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "http://www.w3.org/2000/01/rdf-schema#label",
+            ):
+                continue
+
+            # Same display convention as the property groups: no has_ prefix.
+            prop_name = get_local_name(prop_uri).replace('has_', '')
+
+            obj_binding = binding["obj"]
+            obj_val = obj_binding["value"]
+            # Same classification as the property groups: IRIs outside the
+            # ontology namespace are anyURI literals, not instance links.
+            is_literal = obj_binding.get("type") == "literal" or not obj_val.startswith(get_uri(''))
+
+            key = (prop_name, obj_val, is_literal)
+            if key not in groups_by_inst[inst_id]:
+                groups_by_inst[inst_id][key] = {
+                    "datatype": obj_binding.get("datatype", ""),
+                    "labels": []
+                }
+            if not is_literal and "obj_label" in binding:
+                lang = binding.get("obj_lang", {}).get("value", "")
+                val = binding["obj_label"]["value"]
+                groups_by_inst[inst_id][key]["labels"].append((lang, val))
+
+    candidates_by_inst = {}
+    for inst_id, groups in groups_by_inst.items():
+        candidates = []
+        for (prop_name, obj_val, is_literal), details in groups.items():
+            if is_literal:
+                value = coerce_literal(obj_val, details["datatype"])
+                kind = "literal"
+            else:
+                obj_id = get_local_name(obj_val)
+                value = select_preferred_label(details["labels"], obj_id)
+                kind = "object"
+
+            candidates.append({
+                "property": prop_name,
+                "value": value,
+                "kind": kind
+            })
+        candidates_by_inst[inst_id] = candidates
+    return candidates_by_inst
+
+
+def summarize_preview(candidates, limit=PREVIEW_LIMIT):
+    """Dedupes, orders (literals before object links), and caps preview candidates."""
+    seen = set()
+    deduped = []
+    for c in candidates:
+        key = (c["property"], str(c["value"]), c["kind"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(c)
+
+    deduped.sort(key=lambda c: (c["kind"] != "literal", c["property"], str(c["value"])))
+    return deduped[:limit], len(deduped) > limit
+
+
+def collect_instance_types(inst_ids):
+    """Batched rdf:type lookup: returns {inst_id: sorted local type names}."""
+    if not inst_ids:
+        return {}
+
+    types_by_inst = {inst_id: set() for inst_id in inst_ids}
+    for chunk in chunked(list(inst_ids)):
+        uris_str = " ".join(f"<{get_uri(inst_id)}>" for inst_id in chunk)
+        query = f"""
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        SELECT ?inst ?type WHERE {{
+            GRAPH <{onto_uri}> {{
+                VALUES ?inst {{ {uris_str} }}
+                ?inst rdf:type ?type .
+                FILTER (STRSTARTS(STR(?type), "{get_uri('')}"))
+            }}
+        }}
+        """
+        res = query_graphdb(query)
+        for binding in res.get("results", {}).get("bindings", []):
+            inst_id = get_local_name(binding["inst"]["value"])
+            if inst_id in types_by_inst:
+                types_by_inst[inst_id].add(get_local_name(binding["type"]["value"]))
+    return {inst_id: sorted(types) for inst_id, types in types_by_inst.items()}
+
+
+def get_class_instance_summaries(class_name=None):
+    """
+    Returns instance summaries containing unique ID, label, and direct types list
+    for the specified class. If class_name is None or empty, returns summaries for all instances.
+    """
+    if class_name and str(class_name).strip():
+        validate_class_exists_in_graphdb(class_name)
+        class_iri = get_uri(class_name)
+        class_triple = f"?inst rdf:type/rdfs:subClassOf* <{class_iri}> ."
+    else:
+        class_triple = ""
+        
+    query = f"""
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?inst ?label (LANG(?label) AS ?lang) ?type WHERE {{
+        GRAPH <{onto_uri}> {{
+            {class_triple}
+            ?inst rdf:type ?type .
+            FILTER (STRSTARTS(STR(?type), "http://coupled_modelling.owl#"))
+            OPTIONAL {{
+                ?inst rdfs:label ?label .
+            }}
+        }}
+    }}
+    """
+    res = query_graphdb(query)
+    summaries = build_instance_summaries(res.get("results", {}).get("bindings", []))
+    summaries.sort(key=lambda x: x["label"])
+    return summaries
+
+
+def build_instance_summaries(bindings):
+    """
+    Aggregates SPARQL bindings of shape (?inst ?label ?lang ?type) into the shared
+    instance-summary dicts (id, label, types, property_preview, preview_truncated).
+    Preserves the first-appearance order of instances; callers sort as needed.
+    """
+    inst_data = {}
+    for binding in bindings:
+        inst_id = get_local_name(binding["inst"]["value"])
+        if inst_id not in inst_data:
+            inst_data[inst_id] = {"labels": [], "types": set()}
+        inst_data[inst_id]["types"].add(get_local_name(binding["type"]["value"]))
+        if "label" in binding:
+            lang = binding.get("lang", {}).get("value", "")
+            inst_data[inst_id]["labels"].append((lang, binding["label"]["value"]))
+
+    inst_candidates = collect_preview_candidates(list(inst_data.keys()))
+    summaries = []
+    for inst_id, data in inst_data.items():
+        preview, truncated = summarize_preview(inst_candidates.get(inst_id, []))
+        summaries.append({
+            "id": inst_id,
+            "label": select_preferred_label(data["labels"], inst_id),
+            "types": sorted(data["types"]),
+            "property_preview": preview,
+            "preview_truncated": truncated
+        })
+    return summaries
+
+
+SEARCH_RESULT_LIMIT = 20
+SEARCH_RESULT_LIMIT_MAX = 100
+SEARCH_TYPES = ("all", "class", "instance")
+
+
+def search_entities(text, entity_type="all", limit=SEARCH_RESULT_LIMIT):
+    """
+    Case-insensitive substring search over the local names and labels of project
+    classes and instances. Returns {"classes": [...], "instances": [...]} with each
+    group capped at `limit`; name-prefix matches rank before other matches.
+    Instances carry the same summary shape as get_class_instance_summaries.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Search text must not be empty")
+    if len(text) > 200:
+        raise ValueError("Search text must be at most 200 characters")
+    if entity_type not in SEARCH_TYPES:
+        raise ValueError(f"Invalid search type: {entity_type}. Expected one of {', '.join(SEARCH_TYPES)}")
+    limit = int(limit)
+    if not 1 <= limit <= SEARCH_RESULT_LIMIT_MAX:
+        raise ValueError(f"Search limit must be between 1 and {SEARCH_RESULT_LIMIT_MAX}")
+
+    term_text = text.lower()
+    term = serialize_literal(term_text)
+    namespace = get_uri('')
+    results = {"classes": [], "instances": []}
+
+    if entity_type in ("all", "class"):
+        query = f"""
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT DISTINCT ?name WHERE {{
+            GRAPH <{onto_uri}> {{
+                ?class rdf:type owl:Class .
+                FILTER (STRSTARTS(STR(?class), "{namespace}"))
+                BIND (STRAFTER(STR(?class), "#") AS ?name)
+                OPTIONAL {{ ?class rdfs:label ?anyLabel }}
+                FILTER (CONTAINS(LCASE(?name), {term}) || CONTAINS(LCASE(COALESCE(STR(?anyLabel), "")), {term}))
+            }}
+        }}
+        ORDER BY DESC(STRSTARTS(LCASE(?name), {term})) ?name
+        LIMIT {limit}
+        """
+        res = query_graphdb(query)
+        results["classes"] = [{"id": binding["name"]["value"]} for binding in res.get("results", {}).get("bindings", [])]
+
+    if entity_type in ("all", "instance"):
+        # The subquery anchors on a project-namespace type, not owl:NamedIndividual:
+        # SPARQL-created instances never receive the owl:NamedIndividual triple.
+        query = f"""
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?inst ?label (LANG(?label) AS ?lang) ?type WHERE {{
+            {{
+                SELECT DISTINCT ?inst WHERE {{
+                    GRAPH <{onto_uri}> {{
+                        ?inst rdf:type ?anyType .
+                        FILTER (STRSTARTS(STR(?anyType), "{namespace}"))
+                        BIND (STRAFTER(STR(?inst), "#") AS ?name)
+                        OPTIONAL {{ ?inst rdfs:label ?anyLabel }}
+                        FILTER (CONTAINS(LCASE(?name), {term}) || CONTAINS(LCASE(COALESCE(STR(?anyLabel), "")), {term}))
+                    }}
+                }}
+                LIMIT {limit}
+            }}
+            GRAPH <{onto_uri}> {{
+                ?inst rdf:type ?type .
+                FILTER (STRSTARTS(STR(?type), "{namespace}"))
+                OPTIONAL {{ ?inst rdfs:label ?label }}
+            }}
+        }}
+        """
+        res = query_graphdb(query)
+        results["instances"] = build_instance_summaries(res.get("results", {}).get("bindings", []))
+        # Ranking happens here, not in SPARQL: a subquery's ORDER BY is not
+        # guaranteed to survive the outer join.
+        results["instances"].sort(
+            key=lambda summary: (
+                not (summary["id"].lower().startswith(term_text) or summary["label"].lower().startswith(term_text)),
+                summary["label"].lower(),
+            )
+        )
+
+    return results
+
+
+def get_instance_property_metadata(inst_name):
+    """
+    Retrieves direct outgoing statements for a selected instance with type metadata.
+    """
+    validate_subject_exists(inst_name)
+    inst_uri = get_uri(inst_name)
+    
+    q1 = f"""
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?label (LANG(?label) AS ?lang) ?type WHERE {{
+        GRAPH <{onto_uri}> {{
+            <{inst_uri}> rdf:type ?type .
+            OPTIONAL {{
+                <{inst_uri}> rdfs:label ?label .
+            }}
+        }}
+    }}
+    """
+    
+    q2 = f"""
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?prop ?obj ?obj_label (LANG(?obj_label) AS ?obj_lang) WHERE {{
+        GRAPH <{onto_uri}> {{
+            <{inst_uri}> ?prop ?obj .
+            FILTER (?prop != rdf:type)
+            OPTIONAL {{
+                FILTER(isIRI(?obj))
+                ?obj rdfs:label ?obj_label .
+            }}
+        }}
+    }}
+    """
+    
+    r1 = query_graphdb(q1)
+    r2 = query_graphdb(q2)
+    
+    labels = []
+    types = set()
+    for binding in r1.get("results", {}).get("bindings", []):
+        if "label" in binding:
+            lang = binding.get("lang", {}).get("value", "")
+            val = binding["label"]["value"]
+            labels.append((lang, val))
+        if "type" in binding:
+            type_uri = binding["type"]["value"]
+            if type_uri.startswith("http://coupled_modelling.owl#"):
+                types.add(get_local_name(type_uri))
+                
+    resolved_label = select_preferred_label(labels, inst_name)
+    
+    prop_objects = {}
+    prop_literals = {}
+    
+    for binding in r2.get("results", {}).get("bindings", []):
+        prop_uri = binding["prop"]["value"]
+        prop_name = get_local_name(prop_uri).replace('has_', '')
+        
+        obj_binding = binding["obj"]
+        obj_type = obj_binding.get("type")
+        obj_val = obj_binding["value"]
+        
+        if obj_type == "uri" and obj_val.startswith("http://coupled_modelling.owl#"):
+            obj_id = get_local_name(obj_val)
+            if prop_name not in prop_objects:
+                prop_objects[prop_name] = {}
+            if obj_id not in prop_objects[prop_name]:
+                prop_objects[prop_name][obj_id] = []
+            if "obj_label" in binding:
+                obj_lang = binding.get("obj_lang", {}).get("value", "")
+                obj_lbl = binding["obj_label"]["value"]
+                prop_objects[prop_name][obj_id].append((obj_lang, obj_lbl))
+        else:
+            datatype = "http://www.w3.org/2001/XMLSchema#anyURI" if obj_type == "uri" else obj_binding.get("datatype", "http://www.w3.org/2001/XMLSchema#string")
+            val = obj_val
+            if datatype == "http://www.w3.org/2001/XMLSchema#integer":
+                try:
+                    val = int(obj_val)
+                except ValueError:
+                    pass
+            elif datatype in ("http://www.w3.org/2001/XMLSchema#double", "http://www.w3.org/2001/XMLSchema#float"):
+                try:
+                    val = float(obj_val)
+                except ValueError:
+                    pass
+            elif datatype == "http://www.w3.org/2001/XMLSchema#boolean":
+                val = (obj_val.lower() == "true")
+            
+            literal_dict = {
+                "kind": "literal",
+                "value": val,
+                "datatype": datatype
+            }
+            if "xml:lang" in obj_binding:
+                literal_dict["language"] = obj_binding["xml:lang"]
+            if prop_name not in prop_literals:
+                prop_literals[prop_name] = []
+            prop_literals[prop_name].append(literal_dict)
+            
+    # Linked instances also carry their types and a property preview, so the
+    # inspector can describe unlabeled targets instead of showing a bare id.
+    object_ids = sorted({obj_id for obj_dict in prop_objects.values() for obj_id in obj_dict})
+    types_by_obj = collect_instance_types(object_ids)
+    candidates_by_obj = collect_preview_candidates(object_ids)
+    previews_by_obj = {obj_id: summarize_preview(candidates) for obj_id, candidates in candidates_by_obj.items()}
+
+    properties_map = {}
+    for prop_name, obj_dict in prop_objects.items():
+        if prop_name not in properties_map:
+            properties_map[prop_name] = []
+        for obj_id, labels_list in obj_dict.items():
+            selected_obj_lbl = select_preferred_label(labels_list, obj_id)
+            preview, truncated = previews_by_obj.get(obj_id, ([], False))
+            properties_map[prop_name].append({
+                "kind": "object",
+                "id": obj_id,
+                "label": selected_obj_lbl,
+                "types": types_by_obj.get(obj_id, []),
+                "property_preview": preview,
+                "preview_truncated": truncated
+            })
+            
+    for prop_name, literal_list in prop_literals.items():
+        if prop_name not in properties_map:
+            properties_map[prop_name] = []
+        properties_map[prop_name].extend(literal_list)
+        
+    properties_list = []
+    for prop_name, values in properties_map.items():
+        values.sort(key=lambda x: str(x.get("label", x.get("value", ""))))
+        properties_list.append({
+            "property": prop_name,
+            "values": values
+        })
+    properties_list.sort(key=lambda x: x["property"])
+    
+    return {
+        "id": inst_name,
+        "label": resolved_label,
+        "types": sorted(list(types)),
+        "properties": properties_list
+    }
+
+
+def get_class_metadata(class_name):
+    """
+    Retrieves metadata for a selected class including descriptions, superclasses,
+    subclasses, asserted restrictions, and equivalent classes.
+    """
+    validate_class_exists_in_graphdb(class_name)
+    class_iri = get_uri(class_name)
+    
+    # 1. Fetch descriptions
+    desc_query = f"""
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+    SELECT ?desc WHERE {{
+        GRAPH <{onto_uri}> {{
+            {{ <{class_iri}> rdfs:comment ?desc }}
+            UNION
+            {{ <{class_iri}> skos:definition ?desc }}
+        }}
+    }}
+    """
+    desc_res = query_graphdb(desc_query)
+    descriptions = sorted(list(set(
+        binding["desc"]["value"] 
+        for binding in desc_res.get("results", {}).get("bindings", [])
+        if "desc" in binding
+    )))
+    
+    # 2. Fetch superclasses (direct parent classes) with label preferred grouping
+    super_query = f"""
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?parent ?parent_label (LANG(?parent_label) AS ?lang) WHERE {{
+        GRAPH <{onto_uri}> {{
+            <{class_iri}> rdfs:subClassOf ?parent .
+            FILTER(isIRI(?parent))
+            FILTER(STRSTARTS(STR(?parent), "http://coupled_modelling.owl#"))
+            OPTIONAL {{ ?parent rdfs:label ?parent_label . }}
+        }}
+    }}
+    """
+    super_res = query_graphdb(super_query)
+    super_data = {}
+    for binding in super_res.get("results", {}).get("bindings", []):
+        parent_uri = binding["parent"]["value"]
+        parent_id = get_local_name(parent_uri)
+        if parent_id not in super_data:
+            super_data[parent_id] = []
+        if "parent_label" in binding:
+            lang = binding.get("lang", {}).get("value", "")
+            val = binding["parent_label"]["value"]
+            super_data[parent_id].append((lang, val))
+            
+    superclasses = []
+    for parent_id, label_list in super_data.items():
+        lbl = select_preferred_label(label_list, parent_id)
+        superclasses.append({"id": parent_id, "label": lbl})
+    superclasses.sort(key=lambda x: x["label"].lower())
+    
+    # 3. Fetch subclasses with label preferred grouping
+    sub_query = f"""
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?sub ?sub_label (LANG(?sub_label) AS ?lang) WHERE {{
+        GRAPH <{onto_uri}> {{
+            ?sub rdfs:subClassOf <{class_iri}> .
+            FILTER(isIRI(?sub))
+            FILTER(STRSTARTS(STR(?sub), "http://coupled_modelling.owl#"))
+            OPTIONAL {{ ?sub rdfs:label ?sub_label . }}
+        }}
+    }}
+    """
+    sub_res = query_graphdb(sub_query)
+    sub_data = {}
+    for binding in sub_res.get("results", {}).get("bindings", []):
+        sub_uri = binding["sub"]["value"]
+        sub_id = get_local_name(sub_uri)
+        if sub_id not in sub_data:
+            sub_data[sub_id] = []
+        if "sub_label" in binding:
+            lang = binding.get("lang", {}).get("value", "")
+            val = binding["sub_label"]["value"]
+            sub_data[sub_id].append((lang, val))
+            
+    subclasses = []
+    for sub_id, label_list in sub_data.items():
+        lbl = select_preferred_label(label_list, sub_id)
+        subclasses.append({"id": sub_id, "label": lbl})
+    subclasses.sort(key=lambda x: x["label"].lower())
+    
+    # 4. Fetch equivalent classes (as direct classes) with label preferred grouping
+    eq_query = f"""
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    SELECT ?eq ?eq_label (LANG(?eq_label) AS ?lang) WHERE {{
+        GRAPH <{onto_uri}> {{
+            <{class_iri}> owl:equivalentClass ?eq .
+            FILTER(isIRI(?eq))
+            FILTER(STRSTARTS(STR(?eq), "http://coupled_modelling.owl#"))
+            OPTIONAL {{ ?eq rdfs:label ?eq_label . }}
+        }}
+    }}
+    """
+    eq_res = query_graphdb(eq_query)
+    eq_data = {}
+    for binding in eq_res.get("results", {}).get("bindings", []):
+        eq_uri = binding["eq"]["value"]
+        eq_id = get_local_name(eq_uri)
+        if eq_id not in eq_data:
+            eq_data[eq_id] = []
+        if "eq_label" in binding:
+            lang = binding.get("lang", {}).get("value", "")
+            val = binding["eq_label"]["value"]
+            eq_data[eq_id].append((lang, val))
+            
+    equivalent_classes = []
+    for eq_id, label_list in eq_data.items():
+        lbl = select_preferred_label(label_list, eq_id)
+        equivalent_classes.append({"id": eq_id, "label": lbl})
+    equivalent_classes.sort(key=lambda x: x["label"].lower())
+    
+    # 5. Fetch restrictions with complex target/literal resolving and label preference
+    restr_query = f"""
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX owl: <http://www.w3.org/2002/07/owl#>
+    SELECT ?prop ?prop_label (LANG(?prop_label) AS ?prop_lang) ?kind ?cardinality ?target ?target_label (LANG(?target_label) AS ?target_lbl_lang) ?target_kind (DATATYPE(?target) AS ?target_datatype) (LANG(?target) AS ?target_lang) ?member ?member_label (LANG(?member_label) AS ?member_lang) WHERE {{
+        GRAPH <{onto_uri}> {{
+            {{ <{class_iri}> rdfs:subClassOf ?restr . }}
+            UNION
+            {{ <{class_iri}> owl:equivalentClass ?restr . }}
+            ?restr rdf:type owl:Restriction .
+            ?restr owl:onProperty ?prop .
+            OPTIONAL {{ ?prop rdfs:label ?prop_label . }}
+            
+            {{
+                ?restr owl:someValuesFrom ?target .
+                BIND("some_values_from" AS ?kind)
+                BIND(IF(isIRI(?target), "class", BIND_KIND) AS ?target_kind)
+            }} UNION {{
+                ?restr owl:allValuesFrom ?target .
+                BIND("all_values_from" AS ?kind)
+                BIND(IF(isIRI(?target), "class", BIND_KIND) AS ?target_kind)
+            }} UNION {{
+                ?restr owl:hasValue ?target .
+                BIND("has_value" AS ?kind)
+                BIND(IF(isIRI(?target), "class", BIND_KIND) AS ?target_kind)
+            }} UNION {{
+                ?restr owl:cardinality ?cardinality .
+                BIND("cardinality" AS ?kind)
+            }} UNION {{
+                ?restr owl:minCardinality ?cardinality .
+                BIND("min_cardinality" AS ?kind)
+            }} UNION {{
+                ?restr owl:maxCardinality ?cardinality .
+                BIND("max_cardinality" AS ?kind)
+            }} UNION {{
+                ?restr owl:qualifiedCardinality ?cardinality .
+                BIND("qualified_cardinality" AS ?kind)
+                OPTIONAL {{
+                    ?restr owl:onClass ?targetClass .
+                    BIND(?targetClass AS ?target)
+                    BIND(IF(isIRI(?targetClass), "class", BIND_TARGET_CLASS_KIND) AS ?target_kind)
+                }}
+                OPTIONAL {{
+                    ?restr owl:onDataRange ?targetRange .
+                    BIND(?targetRange AS ?target)
+                    BIND("data_range" AS ?target_kind)
+                }}
+            }} UNION {{
+                ?restr owl:minQualifiedCardinality ?cardinality .
+                BIND("min_qualified_cardinality" AS ?kind)
+                OPTIONAL {{
+                    ?restr owl:onClass ?targetClass .
+                    BIND(?targetClass AS ?target)
+                    BIND(IF(isIRI(?targetClass), "class", BIND_TARGET_CLASS_KIND) AS ?target_kind)
+                }}
+                OPTIONAL {{
+                    ?restr owl:onDataRange ?targetRange .
+                    BIND(?targetRange AS ?target)
+                    BIND("data_range" AS ?target_kind)
+                }}
+            }} UNION {{
+                ?restr owl:maxQualifiedCardinality ?cardinality .
+                BIND("max_qualified_cardinality" AS ?kind)
+                OPTIONAL {{
+                    ?restr owl:onClass ?targetClass .
+                    BIND(?targetClass AS ?target)
+                    BIND(IF(isIRI(?targetClass), "class", BIND_TARGET_CLASS_KIND) AS ?target_kind)
+                }}
+                OPTIONAL {{
+                    ?restr owl:onDataRange ?targetRange .
+                    BIND(?targetRange AS ?target)
+                    BIND("data_range" AS ?target_kind)
+                }}
+            }}
+            
+            OPTIONAL {{
+                FILTER(isIRI(?target))
+                ?target rdfs:label ?target_label .
+            }}
+            
+            OPTIONAL {{
+                ?target owl:intersectionOf/rdf:rest*/rdf:first ?member .
+                FILTER(isIRI(?member))
+                OPTIONAL {{ ?member rdfs:label ?member_label . }}
+            }}
+        }}
+    }}
+    """
+    # Replace temporary SPARQL helper place-holders
+    restr_query = restr_query.replace("BIND_KIND", "IF(isLiteral(?target), 'literal', 'bnode')")
+    restr_query = restr_query.replace("BIND_TARGET_CLASS_KIND", "IF(isLiteral(?targetClass), 'literal', 'bnode')")
+    
+    restr_res = query_graphdb(restr_query)
+    restrictions_data = {}
+    
+    for binding in restr_res.get("results", {}).get("bindings", []):
+        prop_uri = binding["prop"]["value"]
+        prop_id = get_local_name(prop_uri)
+        kind = binding["kind"]["value"]
+        
+        cardinality = None
+        if "cardinality" in binding:
+            try: cardinality = int(binding["cardinality"]["value"])
+            except: cardinality = binding["cardinality"]["value"]
+            
+        target_val = None
+        target_kind = None
+        target_datatype = None
+        target_lang = None
+        if "target" in binding:
+            target_val = binding["target"]["value"]
+            target_kind = binding.get("target_kind", {}).get("value", "class")
+            if "target_datatype" in binding:
+                target_datatype = binding["target_datatype"]["value"]
+            if "target_lang" in binding:
+                target_lang = binding["target_lang"]["value"]
+                
+        key = (prop_id, kind, cardinality, target_val)
+        if key not in restrictions_data:
+            restrictions_data[key] = {
+                "prop_id": prop_id,
+                "prop_labels": [],
+                "kind": kind,
+                "cardinality": cardinality,
+                "target_val": target_val,
+                "target_kind": target_kind,
+                "target_labels": [],
+                "target_datatype": target_datatype,
+                "target_lang": target_lang,
+                "members_map": {}
+            }
+            
+        if "prop_label" in binding:
+            lang = binding.get("prop_lang", {}).get("value", "")
+            val = binding["prop_label"]["value"]
+            restrictions_data[key]["prop_labels"].append((lang, val))
+            
+        if "target_label" in binding:
+            lang = binding.get("target_lbl_lang", {}).get("value", "")
+            val = binding["target_label"]["value"]
+            restrictions_data[key]["target_labels"].append((lang, val))
+            
+        if "member" in binding:
+            member_uri = binding["member"]["value"]
+            member_id = get_local_name(member_uri)
+            if member_id not in restrictions_data[key]["members_map"]:
+                restrictions_data[key]["members_map"][member_id] = []
+            if "member_label" in binding:
+                lang = binding.get("member_lang", {}).get("value", "")
+                val = binding["member_label"]["value"]
+                restrictions_data[key]["members_map"][member_id].append((lang, val))
+                
+    restrictions = []
+    for key, data in restrictions_data.items():
+        prop_lbl = select_preferred_label(data["prop_labels"], data["prop_id"])
+        
+        restr_obj = {
+            "property": {"id": data["prop_id"], "label": prop_lbl},
+            "kind": data["kind"]
+        }
+        
+        if data["cardinality"] is not None:
+            restr_obj["cardinality"] = data["cardinality"]
+            
+        if data["target_val"] is not None:
+            target_id = get_local_name(data["target_val"])
+            
+            if data["target_kind"] == "bnode":
+                members = []
+                for m_id, m_labels in data["members_map"].items():
+                    m_lbl = select_preferred_label(m_labels, m_id)
+                    members.append({"id": m_id, "label": m_lbl})
+                members.sort(key=lambda x: x["label"].lower())
+                
+                if members:
+                    restr_obj["target_kind"] = "intersection"
+                    restr_obj["target"] = {
+                        "id": target_id,
+                        "label": " & ".join(m["label"] for m in members),
+                        "members": members
+                    }
+                else:
+                    restr_obj["target_kind"] = "bnode"
+                    restr_obj["target"] = {
+                        "id": target_id,
+                        "label": f"Anonymous Class ({target_id})"
+                    }
+            elif data["target_kind"] == "literal":
+                val = data["target_val"]
+                if data["target_datatype"] == "http://www.w3.org/2001/XMLSchema#boolean":
+                    val = (val.lower() == "true")
+                elif data["target_datatype"] == "http://www.w3.org/2001/XMLSchema#integer":
+                    try: val = int(val)
+                    except: pass
+                elif data["target_datatype"] in ("http://www.w3.org/2001/XMLSchema#double", "http://www.w3.org/2001/XMLSchema#float"):
+                    try: val = float(val)
+                    except: pass
+                
+                restr_obj["target_kind"] = "literal"
+                restr_obj["target"] = {
+                    "id": data["target_val"],
+                    "label": data["target_val"],
+                    "value": val
+                }
+                if data["target_datatype"]:
+                    restr_obj["target"]["datatype"] = data["target_datatype"]
+                if data["target_lang"]:
+                    restr_obj["target"]["language"] = data["target_lang"]
+            else:
+                target_lbl = select_preferred_label(data["target_labels"], target_id)
+                restr_obj["target_kind"] = data["target_kind"]
+                restr_obj["target"] = {
+                    "id": target_id,
+                    "label": target_lbl
+                }
+                
+        restrictions.append(restr_obj)
+        
+    restrictions.sort(key=lambda x: x["property"]["label"].lower())
+    
+    return {
+        "id": class_name,
+        "label": class_name,
+        "descriptions": descriptions,
+        "superclasses": superclasses,
+        "subclasses": subclasses,
+        "restrictions": restrictions,
+        "equivalent_classes": equivalent_classes
+    }
+
+
+onto_uri = os.getenv("GRAPHDB_GRAPH", "http://coupled_modelling.owl")
+# default_world.set_backend(filename = get_db_path())
+
+try:
+    onto = load_onto()
+except Exception as e:
+    print(f"Failed to load onto: {e}")
+    onto = new_onto()
