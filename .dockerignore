@@ -2,9 +2,13 @@
 .git
 .github
 .idea
+.env*
 **/__pycache__
 **/*.pyc
 tests
 examples
 docs
-CLAUDE.md
+frontend
+coupled_modelling
+setup.py
+.readthedocs.yaml
