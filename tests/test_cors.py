@@ -15,7 +15,7 @@ SPEC_ROUTE = '/api/v1.0/openapi.yaml'
 
 
 class TestCorsHeaders(unittest.TestCase):
-    """CORS headers for the separate Next.js frontend (offline — no GraphDB needed)."""
+    """CORS headers for the Next.js frontend (offline — no GraphDB needed)."""
 
     def setUp(self):
         self.client = TestClient(app)

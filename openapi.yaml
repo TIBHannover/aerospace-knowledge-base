@@ -2,20 +2,20 @@ openapi: 3.1.0
 info:
   title: Coupled Modelling API
   summary: REST API for the coupled multiphysics simulation knowledge base.
-  description: "HTTP API of the coupled_modelling backend: a knowledge base that stores\nKratos
-    CoSimulation configurations as OWL/RDF in a GraphDB triple store.\n\nThe backend
-    uses a hybrid architecture:\n\n* **Direct SPARQL path** — reads and simple mutations
-    (adding, replacing and\n  deleting property values, creating and deleting instances)
-    are executed as\n  stateless SPARQL queries/updates directly against GraphDB.\n*
-    **In-memory semantic path** — structurally complex workflows (Kratos JSON\n  import/export,
+  description: "HTTP API for the Aerospace Knowledge Base, which stores\nKratos CoSimulation
+    configurations as OWL/RDF in a GraphDB triple store.\n\nThe backend uses a hybrid
+    architecture:\n\n* **Direct SPARQL path** — reads and simple mutations (adding,
+    replacing and\n  deleting property values, creating and deleting instances) are
+    executed as\n  stateless SPARQL queries/updates directly against GraphDB.\n* **In-memory
+    semantic path** — structurally complex workflows (Kratos JSON\n  import/export,
     recursive instance copying, class-axiom inference) load the\n  ontology into Owlready2,
     operate on it in memory and synchronise the\n  result back to GraphDB.\n\nInstances
     created through the API receive collision-resistant UUID\nidentifiers (for example
     `instance_550e8400-e29b-41d4-a716-446655440000`);\nhuman-readable names are stored
     separately as `rdfs:label` annotations.\n"
   contact:
-    name: coupled_modelling repository
-    url: https://github.com/ldrbmrtv/coupled_modelling
+    name: Aerospace Knowledge Base repository
+    url: https://github.com/TIBHannover/aerospace-knowledge-base
   version: 1.0.0
 servers:
 - url: http://localhost:5000

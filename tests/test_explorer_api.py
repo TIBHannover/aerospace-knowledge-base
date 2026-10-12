@@ -1,5 +1,5 @@
 """Tests for the metadata, health, and search API endpoints consumed by the
-external web explorer (the separate coupled-modelling-frontend repository)."""
+web explorer in frontend/."""
 import unittest
 from unittest.mock import patch
 import json

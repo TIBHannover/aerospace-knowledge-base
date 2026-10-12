@@ -1,8 +1,7 @@
 """HTTP layer of the knowledge base: the FastAPI application, assembled from one
 router per tag (routers/) over the framework-agnostic core in main.py. The
 OpenAPI document is generated from the routes and served as YAML at
-/api/v1.0/openapi.yaml. The web explorer lives in the separate
-coupled-modelling-frontend repository."""
+/api/v1.0/openapi.yaml. The web explorer lives in frontend/."""
 import os
 import re
 import traceback
@@ -19,7 +18,7 @@ from routing import API_PREFIX, error_response
 API_TITLE = 'Coupled Modelling API'
 API_VERSION = '1.0.0'
 API_SUMMARY = 'REST API for the coupled multiphysics simulation knowledge base.'
-API_DESCRIPTION = """HTTP API of the coupled_modelling backend: a knowledge base that stores
+API_DESCRIPTION = """HTTP API for the Aerospace Knowledge Base, which stores
 Kratos CoSimulation configurations as OWL/RDF in a GraphDB triple store.
 
 The backend uses a hybrid architecture:
@@ -69,7 +68,10 @@ app = FastAPI(
     description=API_DESCRIPTION,
     openapi_tags=API_TAGS,
     servers=[{'url': 'http://localhost:5000', 'description': 'Local development server (uvicorn)'}],
-    contact={'name': 'coupled_modelling repository', 'url': 'https://github.com/ldrbmrtv/coupled_modelling'},
+    contact={
+        'name': 'Aerospace Knowledge Base repository',
+        'url': 'https://github.com/TIBHannover/aerospace-knowledge-base',
+    },
     openapi_url=f'{API_PREFIX}/openapi.json',
     docs_url=f'{API_PREFIX}/docs',
     redoc_url=None,

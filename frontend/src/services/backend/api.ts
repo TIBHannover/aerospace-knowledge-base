@@ -1,7 +1,7 @@
 import ky from 'ky';
 
 /**
- * HTTP client for the coupled_modelling backend.
+ * HTTP client for the Aerospace Knowledge Base backend.
  * All backend calls go through service files in src/services/backend/,
  * one file per resource type.
  *

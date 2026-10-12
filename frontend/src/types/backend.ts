@@ -2,7 +2,7 @@
  * Types for the coupled_modelling API responses.
  *
  * Aliases over the types generated from the backend's OpenAPI document
- * (served at /api/v1.0/openapi.yaml, committed as coupled_modelling/openapi.yaml).
+ * (served at /api/v1.0/openapi.yaml and committed as openapi.yaml at the repository root).
  * Regenerate with `npm run generate:api-types` after the backend changes — do not
  * edit src/types/openapi.ts by hand.
  */
