@@ -22,8 +22,10 @@ class TestKratosImportHelpers(unittest.TestCase):
         # GraphDB with a call that actually raises when it is down.
         try:
             main.query_graphdb("ASK { ?s ?p ?o }")
-        except Exception as e:
-            raise unittest.SkipTest(f"GraphDB not available: {e}")
+        except Exception as error:
+            if os.environ.get("REQUIRE_GRAPHDB_TESTS") == "1":
+                raise
+            raise unittest.SkipTest(f"GraphDB not available: {error}") from error
         main.reload_ontology_from_graphdb()
 
     @classmethod

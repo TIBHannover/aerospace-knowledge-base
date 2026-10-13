@@ -1,10 +1,17 @@
-name: Coupled Modelling CI Pipeline
+name: Backend CI
 
 on:
   push:
-    branches: [ main, dev, "feature/**" ]
+    branches: [main, "feature/**", "fix/**"]
   pull_request:
-    branches: [ main, dev, "feature/**" ]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   offline-tests:
@@ -31,7 +38,6 @@ jobs:
           PYTHONPATH=backend:tests python -m unittest \
             test_serialization \
             test_explorer_api \
-            test_web_mutations \
             test_deletion_sets \
             test_openapi_spec \
             test_api_contract \
@@ -85,9 +91,12 @@ jobs:
           GRAPHDB_URL: http://localhost:7200
           GRAPHDB_REPOSITORY: coupled-modelling-ci-test
           GRAPHDB_GRAPH: http://coupled_modelling.owl
+          REQUIRE_GRAPHDB_TESTS: "1"
         run: |
           PYTHONPATH=backend python backend/load_synthetic_fixture.py
           PYTHONPATH=backend:tests python -m unittest \
-            test_sparql_mutations \
+            test_kratos_import \
             test_sparql_creation \
+            test_sparql_mutations \
+            test_web_mutations \
             -v

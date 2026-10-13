@@ -45,8 +45,10 @@ class TestSparqlCreation(unittest.TestCase):
         """
         try:
             main.sparql_update(init_query)
-        except Exception as e:
-            raise unittest.SkipTest(f"GraphDB not available or failed setup: {e}")
+        except Exception as error:
+            if os.environ.get("REQUIRE_GRAPHDB_TESTS") == "1":
+                raise
+            raise unittest.SkipTest(f"GraphDB not available or failed setup: {error}") from error
 
     @classmethod
     def tearDownClass(cls):

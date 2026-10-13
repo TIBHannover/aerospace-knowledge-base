@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: frontend-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -18,6 +18,9 @@ jobs:
     name: Lint, Types, Format, Tests, Build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
     env:
       NEXT_TELEMETRY_DISABLED: 1
 
@@ -25,13 +28,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      # The Node requirement lives in .nvmrc / package.json engines (Node 18
-      # breaks Array.prototype.toSorted and the Next.js build); CI consumes it.
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
-          node-version-file: .nvmrc
+          node-version-file: frontend/.nvmrc
           cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -53,7 +55,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: vitest-junit
-          path: junit.xml
+          path: frontend/junit.xml
           if-no-files-found: ignore
 
       - name: Build
