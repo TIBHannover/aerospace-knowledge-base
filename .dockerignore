@@ -1,0 +1,14 @@
+# Trims the build context; the Dockerfile's COPY list governs image contents.
+.git
+.github
+.idea
+.env*
+**/__pycache__
+**/*.pyc
+tests
+examples
+docs
+frontend
+coupled_modelling
+setup.py
+.readthedocs.yaml

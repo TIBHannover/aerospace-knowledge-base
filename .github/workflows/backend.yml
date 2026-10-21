@@ -1,0 +1,102 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [main, "feature/**", "fix/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-tests:
+    name: Fast Mock-Isolated Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run offline test suite
+        run: |
+          PYTHONPATH=backend:tests python -m unittest \
+            test_serialization \
+            test_explorer_api \
+            test_deletion_sets \
+            test_openapi_spec \
+            test_api_contract \
+            test_cors \
+            -v
+
+  graphdb-integration-tests:
+    name: GraphDB Integration Tests (Docker)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Start GraphDB Docker container
+        run: |
+          docker run -d --name graphdb -p 7200:7200 ontotext/graphdb:10.8.4
+
+      - name: Wait for GraphDB server readiness
+        run: |
+          echo "Waiting for GraphDB REST API to become ready on http://localhost:7200..."
+          for i in {1..60}; do
+            if curl -fsS http://localhost:7200/rest/repositories >/dev/null 2>&1; then
+              echo "GraphDB server is ready!"
+              exit 0
+            fi
+            echo "GraphDB is starting (attempt $i)..."
+            sleep 2
+          done
+          echo "GraphDB failed to start within timeout"
+          exit 1
+
+      - name: Create CI test repository
+        run: |
+          curl -fsS -X POST http://localhost:7200/rest/repositories \
+            -F "config=@.github/graphdb/ci-repo-config.ttl"
+
+      - name: Populate synthetic ontology fixture and run integration tests
+        env:
+          GRAPHDB_URL: http://localhost:7200
+          GRAPHDB_REPOSITORY: coupled-modelling-ci-test
+          GRAPHDB_GRAPH: http://coupled_modelling.owl
+          REQUIRE_GRAPHDB_TESTS: "1"
+        run: |
+          PYTHONPATH=backend python backend/load_synthetic_fixture.py
+          PYTHONPATH=backend:tests python -m unittest \
+            test_kratos_import \
+            test_sparql_creation \
+            test_sparql_mutations \
+            test_web_mutations \
+            -v

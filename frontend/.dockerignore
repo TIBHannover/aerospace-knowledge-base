@@ -1,0 +1,10 @@
+.git
+.github
+node_modules
+.next
+coverage
+junit.xml
+.env*
+AGENTS.md
+CLAUDE.md
+GEMINI.md
